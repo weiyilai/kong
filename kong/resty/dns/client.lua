@@ -1,3 +1,10 @@
+-- Use the new dns client library instead. If you want to switch to the original
+-- one, you can set `new_dns_client = off` in kong.conf.
+if ngx.shared.kong_dns_cache and _G.busted_new_dns_client ~= false then
+  package.loaded["kong.dns.client"] = nil
+  return require("kong.dns.client")
+end
+
 --------------------------------------------------------------------------
 -- DNS client.
 --
@@ -25,13 +32,14 @@ local fileexists = require("pl.path").exists
 local semaphore = require("ngx.semaphore").new
 local lrucache = require("resty.lrucache")
 local resolver = require("resty.dns.resolver")
-local cycle_aware_deep_copy = require("kong.tools.utils").cycle_aware_deep_copy
+local cycle_aware_deep_copy = require("kong.tools.table").cycle_aware_deep_copy
 local req_dyn_hook = require("kong.dynamic_hook")
 local time = ngx.now
 local log = ngx.log
 local ERR = ngx.ERR
 local WARN = ngx.WARN
 local ALERT = ngx.ALERT
+local NOTICE = ngx.NOTICE
 local DEBUG = ngx.DEBUG
 --[[
   DEBUG = ngx.WARN
@@ -49,14 +57,15 @@ local table_concat = table.concat
 local string_lower = string.lower
 local string_byte  = string.byte
 
-local req_dyn_hook_run_hooks = req_dyn_hook.run_hooks
+local req_dyn_hook_run_hook = req_dyn_hook.run_hook
 
 
 local DOT   = string_byte(".")
 local COLON = string_byte(":")
+local DEFAULT_TIMEOUT = 2000 -- 2000 is openresty default
 
-local EMPTY = setmetatable({},
-  {__newindex = function() error("The 'EMPTY' table is read-only") end})
+
+local EMPTY = require("kong.tools.table").EMPTY
 
 -- resolver options
 local config
@@ -143,7 +152,7 @@ local cachelookup = function(qname, qtype)
 
   local ctx = ngx.ctx
   if ctx and ctx.has_timing then
-    req_dyn_hook_run_hooks(ctx, "timing", "dns:cache_lookup", cached ~= nil)
+    req_dyn_hook_run_hook("timing", "dns:cache_lookup", cached ~= nil)
   end
 
   if cached then
@@ -621,10 +630,15 @@ _M.init = function(options)
     if resolv.options.timeout then
       options.timeout = resolv.options.timeout * 1000
     else
-      options.timeout = 2000  -- 2000 is openresty default
+      options.timeout = DEFAULT_TIMEOUT
     end
   end
-  log(DEBUG, PREFIX, "timeout = ", options.timeout, " ms")
+  if options.timeout > 0 then
+    log(DEBUG, PREFIX, "timeout = ", options.timeout, " ms")
+  else
+    log(NOTICE, PREFIX, "timeout = ", DEFAULT_TIMEOUT, " ms (a non-positive timeout of ", options.timeout, " configured - using default timeout)")
+    options.timeout = DEFAULT_TIMEOUT
+  end
 
   -- setup the search order
   options.ndots = options.ndots or resolv.options.ndots or 1
@@ -906,8 +920,10 @@ end
 -- @param dnsCacheOnly if true, no active lookup is done when there is no (stale)
 -- data. In that case an error is returned (as a dns server failure table).
 -- @param try_list the try_list object to add to
+-- @param force_no_sync force noSyncronisation
 -- @return `entry + nil + try_list`, or `nil + err + try_list`
-local function lookup(qname, r_opts, dnsCacheOnly, try_list)
+local function lookup(qname, r_opts, dnsCacheOnly, try_list, force_no_sync)
+  local no_sync = noSynchronisation or force_no_sync or false
   local entry = cachelookup(qname, r_opts.qtype)
   if not entry then
     --not found in cache
@@ -925,7 +941,7 @@ local function lookup(qname, r_opts, dnsCacheOnly, try_list)
     -- perform a sync lookup, as we have no stale data to fall back to
     try_list = try_add(try_list, qname, r_opts.qtype, "cache-miss")
     -- while kong is exiting, we cannot use timers and hence we run all our queries without synchronization
-    if noSynchronisation then
+    if no_sync then
       return individualQuery(qname, r_opts, try_list)
     elseif ngx.worker and ngx.worker.exiting() then
       log(DEBUG, PREFIX, "DNS query not synchronized because the worker is shutting down")
@@ -1136,8 +1152,9 @@ end
 -- The field `additional_section` will default to `true` instead of `false`.
 -- @param dnsCacheOnly Only check the cache, won't do server lookups
 -- @param try_list (optional) list of tries to add to
+-- @param force_no_sync force noSynchronisation
 -- @return `list of records + nil + try_list`, or `nil + err + try_list`.
-local function resolve(qname, r_opts, dnsCacheOnly, try_list)
+local function resolve(qname, r_opts, dnsCacheOnly, try_list, force_no_sync)
   qname = string_lower(qname)
   local qtype = (r_opts or EMPTY).qtype
   local err, records
@@ -1179,7 +1196,7 @@ local function resolve(qname, r_opts, dnsCacheOnly, try_list)
       if (records[1] or EMPTY).type == _M.TYPE_CNAME and qtype ~= _M.TYPE_CNAME then
         opts.qtype = nil
         add_status_to_try_list(try_list, "dereferencing CNAME")
-        return resolve(records[1].cname, opts, dnsCacheOnly, try_list)
+        return resolve(records[1].cname, opts, dnsCacheOnly, try_list, force_no_sync)
       end
 
       -- return the shortname cache hit
@@ -1222,7 +1239,7 @@ local function resolve(qname, r_opts, dnsCacheOnly, try_list)
 
     -- go look it up
     opts.qtype = try_type
-    records, err, try_list = lookup(try_name, opts, dnsCacheOnly, try_list)
+    records, err, try_list = lookup(try_name, opts, dnsCacheOnly, try_list, force_no_sync)
     if not records then
       -- An error has occurred, terminate the lookup process.  We don't want to try other record types because
       -- that would potentially cause us to respond with wrong answers (i.e. the contents of an A record if the
@@ -1279,7 +1296,7 @@ local function resolve(qname, r_opts, dnsCacheOnly, try_list)
         if records[1].type == _M.TYPE_CNAME and qtype ~= _M.TYPE_CNAME then
           opts.qtype = nil
           add_status_to_try_list(try_list, "dereferencing CNAME")
-          return resolve(records[1].cname, opts, dnsCacheOnly, try_list)
+          return resolve(records[1].cname, opts, dnsCacheOnly, try_list, force_no_sync)
         end
 
         return records, nil, try_list
@@ -1479,17 +1496,18 @@ end
 -- representing the entire resolution history for a call. To prevent unnecessary
 -- string concatenations on a hot code path, it is not logged in this module.
 -- If you need to log it, just log `tostring(try_list)` from the caller code.
--- @function toip
+-- @function execute_toip
 -- @param qname hostname to resolve
 -- @param port (optional) default port number to return if none was found in
 -- the lookup chain (only SRV records carry port information, SRV with `port=0` will be ignored)
 -- @param dnsCacheOnly Only check the cache, won't do server lookups (will
 -- not invalidate any ttl expired data and will hence possibly return expired data)
 -- @param try_list (optional) list of tries to add to
+-- @param force_no_sync force noSynchronisation = true for a single call
 -- @return `ip address + port + try_list`, or in case of an error `nil + error + try_list`
-local function toip(qname, port, dnsCacheOnly, try_list)
+local function execute_toip(qname, port, dnsCacheOnly, try_list, force_no_sync)
   local rec, err
-  rec, err, try_list = resolve(qname, nil, dnsCacheOnly, try_list)
+  rec, err, try_list = resolve(qname, nil, dnsCacheOnly, try_list, force_no_sync)
   if err then
     return nil, err, try_list
   end
@@ -1499,11 +1517,24 @@ local function toip(qname, port, dnsCacheOnly, try_list)
     -- our SRV entry might still contain a hostname, so recurse, with found port number
     local srvport = (entry.port ~= 0 and entry.port) or port -- discard port if it is 0
     add_status_to_try_list(try_list, "dereferencing SRV")
-    return toip(entry.target, srvport, dnsCacheOnly, try_list)
+    return execute_toip(entry.target, srvport, dnsCacheOnly, try_list, force_no_sync)
   end
 
   -- must be A or AAAA
   return rec[roundRobin(rec)].address, port, try_list
+end
+
+-- @see execute_toip
+local function toip(...)
+  return execute_toip(...)
+end
+
+
+-- This function calls execute_toip() forcing it to always execute an individual
+-- query for each resolve, ignoring the noSynchronisation option.
+-- @see execute_toip
+local function individual_toip(qname, port, dnsCacheOnly, try_list)
+  return execute_toip(qname, port, dnsCacheOnly, try_list, true)
 end
 
 
@@ -1558,6 +1589,7 @@ end
 -- export local functions
 _M.resolve = resolve
 _M.toip = toip
+_M.individual_toip = individual_toip
 _M.connect = connect
 _M.setpeername = setpeername
 

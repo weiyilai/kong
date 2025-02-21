@@ -1,7 +1,8 @@
 local Router
-local atc_compat = require "kong.router.compat"
 local path_handling_tests = require "spec.fixtures.router_path_handling_tests"
-local uuid = require("kong.tools.utils").uuid
+local uuid = require("kong.tools.uuid").uuid
+local get_expression = require("kong.router.transform").get_expression
+local deep_copy = require("kong.tools.table").deep_copy
 
 local function reload_router(flavor, subsystem)
   _G.kong = {
@@ -22,16 +23,6 @@ local function reload_router(flavor, subsystem)
 end
 
 local function new_router(cases, old_router)
-  -- add fields expression/priority only for flavor expressions
-  if kong.configuration.router_flavor == "expressions" then
-    for _, v in ipairs(cases) do
-      local r = v.route
-
-      r.expression = r.expression or atc_compat.get_expression(r)
-      r.priority = r.priority or atc_compat._get_priority(r)
-    end
-  end
-
   return Router.new(cases, nil, nil, old_router)
 end
 
@@ -55,7 +46,12 @@ local spy_stub = {
   nop = function() end
 }
 
-local function mock_ngx(method, request_uri, headers, queries)
+local function mock_ngx(method, request_uri, headers, queries, vars)
+  method = method or "GET"
+  request_uri = request_uri or "/"
+  headers = headers or {}
+  queries = queries or {}
+  vars = vars or {}
   local _ngx
   _ngx = {
     log = ngx.log,
@@ -65,11 +61,12 @@ local function mock_ngx(method, request_uri, headers, queries)
       http_kong_debug = headers.kong_debug
     }, {
       __index = function(_, key)
-        if key == "http_host" then
+        if key:sub(1, 5) == "http_" then
           spy_stub.nop()
-          return headers.host
+          return headers[key:sub(6)] or vars[key]
         end
-      end
+        return vars[key]
+      end,
     }),
     req = {
       get_method = function()
@@ -81,7 +78,7 @@ local function mock_ngx(method, request_uri, headers, queries)
       get_uri_args = function()
         return queries
       end,
-    }
+    },
   }
 
   return _ngx
@@ -1743,6 +1740,63 @@ for _, flavor in ipairs({ "traditional", "traditional_compatible", "expressions"
       end)
 
       if flavor ~= "traditional" then
+        describe("[wildcard sni]", function()
+          local use_case, router
+
+          lazy_setup(function()
+            use_case = {
+              {
+                service = service,
+                route   = {
+                  id = "e8fb37f1-102d-461e-9c51-6608a6bb8101",
+                  snis = { "*.sni.test" },
+                },
+              },
+              {
+                service = service,
+                route   = {
+                  id = "e8fb37f1-102d-461e-9c51-6608a6bb8102",
+                  snis = { "sni.*" },
+                },
+              },
+            }
+
+            router = assert(new_router(use_case))
+          end)
+
+          it("matches leftmost wildcards", function()
+            for _, sni in ipairs({"foo.sni.test", "foo.bar.sni.test"}) do
+              local match_t = router:select("GET", "/", "any.test", "https", nil, nil, nil, nil,
+                                            sni)
+              assert.truthy(match_t)
+              assert.same(use_case[1].route, match_t.route)
+              assert.same(nil, match_t.matches.method)
+              assert.same(nil, match_t.matches.uri)
+              assert.same(nil, match_t.matches.uri_captures)
+            end
+          end)
+
+          it("matches rightmost wildcards", function()
+            for _, sni in ipairs({"sni.foo", "sni.foo.bar"}) do
+              local match_t = router:select("GET", "/", "any.test", "https", nil, nil, nil, nil,
+                                            sni)
+              assert.truthy(match_t)
+              assert.same(use_case[2].route, match_t.route)
+            end
+          end)
+
+          it("doesn't match wildcard", function()
+            for _, sni in ipairs({"bar.sni.foo", "foo.sni.test.bar"}) do
+              local match_t = router:select("GET", "/", "any.test", "https", nil, nil, nil, nil,
+                                            sni)
+              assert.is_nil(match_t)
+            end
+          end)
+        end)
+      end -- if flavor ~= "traditional" then
+
+
+      if flavor ~= "traditional" then
         describe("incremental rebuild", function()
           local router
           local use_case = {
@@ -2131,11 +2185,50 @@ for _, flavor in ipairs({ "traditional", "traditional_compatible", "expressions"
             assert.spy(add_matcher).was_called(2)
             assert.spy(remove_matcher).was_called(2)
           end)
+
+          it("works well if route has no proper id", function()
+            local wrong_use_case = {
+              {
+                service = service,
+                route = {
+                  id = nil,   -- no id here
+                  paths = { "/foo", },
+                  updated_at = 100,
+                },
+              },
+            }
+
+            local nrouter = new_router(wrong_use_case, router)
+            assert.is_nil(nrouter)
+            assert.falsy(router.rebuilding)
+
+            local use_case = {
+              {
+                service = service,
+                route = {
+                  id = "e8fb37f1-102d-461e-9c51-6608a6bb8101",
+                  paths = { "/foo1", },
+                  updated_at = 100,
+                },
+              },
+            }
+
+            local nrouter = assert(new_router(use_case, router))
+
+            assert.equal(nrouter, router)
+            assert.falsy(router.rebuilding)
+
+            local match_t = nrouter:select("GET", "/foo1")
+            assert.truthy(match_t)
+            assert.same(use_case[1].route, match_t.route)
+
+            match_t = nrouter:select("GET", "/bar")
+            assert.falsy(match_t)
+          end)
         end)
 
         describe("check empty route fields", function()
           local use_case
-          local get_expression = atc_compat.get_expression
 
           before_each(function()
             use_case = {
@@ -2193,7 +2286,6 @@ for _, flavor in ipairs({ "traditional", "traditional_compatible", "expressions"
 
         describe("raw string", function()
           local use_case
-          local get_expression = atc_compat.get_expression
 
           before_each(function()
             use_case = {
@@ -2226,7 +2318,6 @@ for _, flavor in ipairs({ "traditional", "traditional_compatible", "expressions"
 
         describe("check regex with '\\'", function()
           local use_case
-          local get_expression = atc_compat.get_expression
 
           before_each(function()
             use_case = {
@@ -2259,7 +2350,6 @@ for _, flavor in ipairs({ "traditional", "traditional_compatible", "expressions"
 
         describe("generate http expression", function()
           local use_case
-          local get_expression = atc_compat.get_expression
 
           before_each(function()
             use_case = {
@@ -3394,6 +3484,26 @@ for _, flavor in ipairs({ "traditional", "traditional_compatible", "expressions"
         assert.is_nil(match_t.matches.headers)
       end)
 
+      it("uri_captures works well with the optional capture group. Fix #13014", function()
+        local use_case = {
+          {
+            service = service,
+            route   = {
+              id = "e8fb37f1-102d-461e-9c51-6608a6bb8101",
+              paths = { [[~/(users/)?1984/(?<subpath>profile)$]] },
+            },
+          },
+        }
+
+        local router = assert(new_router(use_case))
+        local _ngx = mock_ngx("GET", "/1984/profile", { host = "domain.org" })
+        router._set_ngx(_ngx)
+        local match_t = router:exec()
+        assert.falsy(match_t.matches.uri_captures[1])
+        assert.equal("profile", match_t.matches.uri_captures.subpath)
+        assert.is_nil(match_t.matches.uri_captures.scope)
+      end)
+
       it("returns uri_captures from a [uri regex]", function()
         local use_case = {
           {
@@ -3637,7 +3747,8 @@ for _, flavor in ipairs({ "traditional", "traditional_compatible", "expressions"
         }
 
         lazy_setup(function()
-          router = assert(new_router(use_case_routes))
+          -- deep copy use_case_routes in case it changes
+          router = assert(new_router(deep_copy(use_case_routes)))
         end)
 
         it("strips the specified paths from the given uri if matching", function()
@@ -3691,7 +3802,8 @@ for _, flavor in ipairs({ "traditional", "traditional_compatible", "expressions"
             },
           }
 
-          local router = assert(new_router(use_case_routes))
+          -- deep copy use_case_routes in case it changes
+          local router = assert(new_router(deep_copy(use_case_routes)))
 
           local _ngx = mock_ngx("POST", "/my-route/hello/world",
                                 { host = "domain.org" })
@@ -4307,6 +4419,7 @@ for _, flavor in ipairs({ "traditional", "traditional_compatible", "expressions"
                 service = service,
                 route = {
                   id = "e8fb37f1-102d-461e-9c51-6608a6bb8101",
+                  protocols = { "tcp", },
                   sources = {
                     { ip = "127.0.0.1" },
                     { ip = "127.0.0.2" },
@@ -4317,6 +4430,7 @@ for _, flavor in ipairs({ "traditional", "traditional_compatible", "expressions"
                 service = service,
                 route = {
                   id = "e8fb37f1-102d-461e-9c51-6608a6bb8102",
+                  protocols = { "tcp", },
                   sources = {
                     { port = 65001 },
                     { port = 65002 },
@@ -4328,6 +4442,7 @@ for _, flavor in ipairs({ "traditional", "traditional_compatible", "expressions"
                 service = service,
                 route = {
                   id = "e8fb37f1-102d-461e-9c51-6608a6bb8103",
+                  protocols = { "tcp", },
                   sources = {
                     { ip = "127.168.0.0/8" },
                   }
@@ -4338,6 +4453,7 @@ for _, flavor in ipairs({ "traditional", "traditional_compatible", "expressions"
                 service = service,
                 route = {
                   id = "e8fb37f1-102d-461e-9c51-6608a6bb8104",
+                  protocols = { "tcp", },
                   sources = {
                     { ip = "127.0.0.1", port = 65001 },
                   }
@@ -4347,6 +4463,7 @@ for _, flavor in ipairs({ "traditional", "traditional_compatible", "expressions"
                 service = service,
                 route = {
                   id = "e8fb37f1-102d-461e-9c51-6608a6bb8105",
+                  protocols = { "tcp", },
                   sources = {
                     { ip = "127.0.0.2", port = 65300 },
                     { ip = "127.168.0.0/16", port = 65301 },
@@ -4416,6 +4533,7 @@ for _, flavor in ipairs({ "traditional", "traditional_compatible", "expressions"
                 service = service,
                 route = {
                   id = "e8fb37f1-102d-461e-9c51-6608a6bb8101",
+                  protocols = { "tcp", },
                   destinations = {
                     { ip = "127.0.0.1" },
                     { ip = "127.0.0.2" },
@@ -4426,6 +4544,7 @@ for _, flavor in ipairs({ "traditional", "traditional_compatible", "expressions"
                 service = service,
                 route = {
                   id = "e8fb37f1-102d-461e-9c51-6608a6bb8102",
+                  protocols = { "tcp", },
                   destinations = {
                     { port = 65001 },
                     { port = 65002 },
@@ -4437,6 +4556,7 @@ for _, flavor in ipairs({ "traditional", "traditional_compatible", "expressions"
                 service = service,
                 route = {
                   id = "e8fb37f1-102d-461e-9c51-6608a6bb8103",
+                  protocols = { "tcp", },
                   destinations = {
                     { ip = "127.168.0.0/8" },
                   }
@@ -4447,6 +4567,7 @@ for _, flavor in ipairs({ "traditional", "traditional_compatible", "expressions"
                 service = service,
                 route = {
                   id = "e8fb37f1-102d-461e-9c51-6608a6bb8104",
+                  protocols = { "tcp", },
                   destinations = {
                     { ip = "127.0.0.1", port = 65001 },
                   }
@@ -4456,6 +4577,7 @@ for _, flavor in ipairs({ "traditional", "traditional_compatible", "expressions"
                 service = service,
                 route = {
                   id = "e8fb37f1-102d-461e-9c51-6608a6bb8105",
+                  protocols = { "tcp", },
                   destinations = {
                     { ip = "127.0.0.2", port = 65300 },
                     { ip = "127.168.0.0/16", port = 65301 },
@@ -4613,6 +4735,7 @@ for _, flavor in ipairs({ "traditional", "traditional_compatible", "expressions"
               service = service,
               route = {
                 id = "e8fb37f1-102d-461e-9c51-6608a6bb8101",
+                protocols = { "tls", },
                 snis = { "www.example.org" },
               }
             },
@@ -4620,6 +4743,7 @@ for _, flavor in ipairs({ "traditional", "traditional_compatible", "expressions"
               service = service,
               route = {
                 id = "e8fb37f1-102d-461e-9c51-6608a6bb8102",
+                protocols = { "tls", },
                 sources = {
                   { ip = "127.0.0.1" },
                 }
@@ -4629,6 +4753,7 @@ for _, flavor in ipairs({ "traditional", "traditional_compatible", "expressions"
               service = service,
               route = {
                 id = "e8fb37f1-102d-461e-9c51-6608a6bb8103",
+                protocols = { "tls", },
                 destinations = {
                   { ip = "172.168.0.1" },
                 }
@@ -4655,6 +4780,7 @@ for _, flavor in ipairs({ "traditional", "traditional_compatible", "expressions"
               service = service,
               route = {
                 id = "e8fb37f1-102d-461e-9c51-6608a6bb8101",
+                protocols = { "tls", },
                 snis = { "www.example.org" },
               }
             },
@@ -4662,6 +4788,7 @@ for _, flavor in ipairs({ "traditional", "traditional_compatible", "expressions"
               service = service,
               route = {
                 id = "e8fb37f1-102d-461e-9c51-6608a6bb8102",
+                protocols = { "tls", },
                 sources = {
                   { ip = "127.0.0.1" },
                 },
@@ -4688,8 +4815,6 @@ for _, flavor in ipairs({ "traditional", "traditional_compatible", "expressions"
         -- enable stream subsystem
         reload_router(flavor, "stream")
 
-        local get_expression = require("kong.router.compat").get_expression
-
         describe("check empty route fields", function()
           local use_case
 
@@ -4699,6 +4824,7 @@ for _, flavor in ipairs({ "traditional", "traditional_compatible", "expressions"
                 service = service,
                 route = {
                   id = "e8fb37f1-102d-461e-9c51-6608a6bb8101",
+                  protocols = { "tls" },
                   snis = { "www.example.org" },
                   sources = {
                     { ip = "127.0.0.1" },
@@ -4822,7 +4948,7 @@ end)
 end -- for flavor
 
 
-for _, flavor in ipairs({ "traditional", "traditional_compatible" }) do
+for _, flavor in ipairs({ "traditional", "traditional_compatible", "expressions" }) do
   describe("Router (flavor = " .. flavor .. ")", function()
     reload_router(flavor)
 
@@ -4860,7 +4986,8 @@ for _, flavor in ipairs({ "traditional", "traditional_compatible" }) do
           },
         }
 
-        router = assert(new_router(use_case))
+          -- deep copy use_case in case it changes
+        router = assert(new_router(deep_copy(use_case)))
       end)
 
       it("[assigns different priorities to regex and non-regex path]", function()
@@ -4908,7 +5035,8 @@ for _, flavor in ipairs({ "traditional", "traditional_compatible" }) do
           },
         }
 
-        router = assert(new_router(use_case))
+        -- deep copy use_case in case it changes
+        router = assert(new_router(deep_copy(use_case)))
       end)
 
       it("[assigns different priorities to each path]", function()
@@ -4939,8 +5067,7 @@ for _, flavor in ipairs({ "traditional", "traditional_compatible" }) do
   end)
 end
 
-do
-  local flavor = "traditional_compatible"
+for _, flavor in ipairs({ "traditional_compatible", "expressions" }) do
 
   describe("Router (flavor = " .. flavor .. ")", function()
     reload_router(flavor)
@@ -5032,7 +5159,55 @@ do
       assert.same("/bar", match_t.upstream_uri)
     end)
   end)
-end   -- local flavor = "traditional_compatible"
+
+  describe("Router (flavor = " .. flavor .. ")", function()
+    reload_router(flavor, "stream")
+
+    it("[#stream SNI-based routing does work using tls_passthrough]", function()
+      local use_case = {
+        {
+          service = service,
+          route   = {
+            id = "e8fb37f1-102d-461e-9c51-6608a6bb8101",
+            protocols = { "tls_passthrough", },
+            snis = { "www.example.com" },
+            preserve_host = true,
+          },
+        },
+        {
+          service = service,
+          route   = {
+            id = "e8fb37f1-102d-461e-9c51-6608a6bb8102",
+            protocols = { "tls_passthrough", },
+            snis = { "www.example.org" },
+            preserve_host = true,
+          },
+        },
+      }
+
+      local router = assert(new_router(use_case))
+
+      local _ngx = mock_ngx(nil, nil, nil, nil, {
+        ssl_preread_server_name = "www.example.com",
+      })
+      router._set_ngx(_ngx)
+      local match_t = router:exec()
+
+      assert.truthy(match_t)
+      assert.same(use_case[1].route, match_t.route)
+
+      local _ngx =  mock_ngx(nil, nil, nil, nil, {
+        ssl_preread_server_name = "www.example.org",
+      })
+      router._set_ngx(_ngx)
+      local match_t = router:exec()
+
+      assert.truthy(match_t)
+      assert.same(use_case[2].route, match_t.route)
+    end)
+  end)
+end   -- for flavor
+
 
 do
   local flavor = "expressions"
@@ -5073,13 +5248,11 @@ do
     end)
 
     it("exec() should match tls with tls.sni", function()
-      local _ngx = {
-        var = {
-          remote_port = 1000,
-          server_port = 1000,
-          ssl_preread_server_name = "www.example.com",
-        },
-      }
+      local _ngx = mock_ngx(nil, nil, nil, nil, {
+        remote_port = 1000,
+        server_port = 1000,
+        ssl_preread_server_name = "www.example.com",
+      })
       router._set_ngx(_ngx)
       local match_t = router:exec()
       assert.truthy(match_t)
@@ -5088,13 +5261,11 @@ do
     end)
 
     it("exec() should match tls_passthrough with tls.sni", function()
-      local _ngx = {
-        var = {
-          remote_port = 1000,
-          server_port = 1000,
-          ssl_preread_server_name = "www.example.org",
-        },
-      }
+      local _ngx = mock_ngx(nil, nil, nil, nil, {
+        remote_port = 1000,
+        server_port = 1000,
+        ssl_preread_server_name = "www.example.org",
+      })
       router._set_ngx(_ngx)
       local match_t = router:exec()
       assert.truthy(match_t)
@@ -5663,5 +5834,95 @@ do
       assert.falsy(match_t)
     end)
   end)
-end   -- local flavor = "expressions"
 
+  describe("Router (flavor = " .. flavor .. ") [http]", function()
+    reload_router(flavor)
+
+    it("rejects other fields if expression field exists", function()
+      local use_case = {
+        {
+          service = service,
+          route   = {
+            id = "e8fb37f1-102d-461e-9c51-6608a6bb8101",
+            paths = { "/foo" },                       -- rejected
+            expression = [[http.path ^= r#"/bar"#]],  -- effective
+          },
+        },
+      }
+
+      local router = assert(new_router(use_case))
+
+      local match_t = router:select("GET", "/foo")
+      assert.falsy(match_t)
+
+      local match_t = router:select("GET", "/bar")
+      assert.truthy(match_t)
+    end)
+
+    it("expression route has higher priority than traditional route", function()
+      local use_case = {
+        {
+          service = service,
+          route   = {
+            id = "e8fb37f1-102d-461e-9c51-6608a6bb8101",
+            paths = { "/foo" },
+          },
+        },
+      }
+
+      local router = assert(new_router(use_case))
+
+      local match_t = router:select("GET", "/foo/bar")
+      assert.truthy(match_t)
+      assert.same(use_case[1].route, match_t.route)
+
+      table.insert(use_case, {
+          service = service,
+          route   = {
+            id = "e8fb37f1-102d-461e-9c51-6608a6bb8102",
+            expression = [[http.path ^= r#"/foo"#]],
+          },
+      })
+
+      local router = assert(new_router(use_case))
+
+      local match_t = router:select("GET", "/foo/bar")
+      assert.truthy(match_t)
+      assert.same(use_case[2].route, match_t.route)
+    end)
+
+    it("works when route.priority is near 2^46", function()
+      local use_case = {
+        {
+          service = service,
+          route   = {
+            id = "e8fb37f1-102d-461e-9c51-6608a6bb8101",
+            expression = [[http.path ^= r#"/foo"#]],
+            priority = 2^46 - 3,
+          },
+        },
+      }
+
+      local router = assert(new_router(use_case))
+
+      local match_t = router:select("GET", "/foo/bar")
+      assert.truthy(match_t)
+      assert.same(use_case[1].route, match_t.route)
+
+      table.insert(use_case, {
+          service = service,
+          route   = {
+            id = "e8fb37f1-102d-461e-9c51-6608a6bb8102",
+            expression = [[http.path ^= r#"/foo"#]],
+            priority = 2^46 - 2,
+          },
+      })
+
+      local router = assert(new_router(use_case))
+
+      local match_t = router:select("GET", "/foo/bar")
+      assert.truthy(match_t)
+      assert.same(use_case[2].route, match_t.route)
+    end)
+  end)
+end   -- local flavor = "expressions"

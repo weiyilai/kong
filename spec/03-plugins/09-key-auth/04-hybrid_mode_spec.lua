@@ -1,7 +1,11 @@
 local helpers = require "spec.helpers"
 
+
+for _, v in ipairs({ {"off", "off"}, {"on", "off"}, {"on", "on"}, }) do
+  local rpc, rpc_sync = v[1], v[2]
+
 for _, strategy in helpers.each_strategy({"postgres"}) do
-  describe("Plugin: key-auth (access) [#" .. strategy .. "] auto-expiring keys", function()
+  describe("Plugin: key-auth (access) [#" .. strategy .. " rpc_sync=" .. rpc_sync .. "] auto-expiring keys", function()
     -- Give a bit of time to reduce test flakyness on slow setups
     local ttl = 10
     local inserted_at
@@ -38,6 +42,8 @@ for _, strategy in helpers.each_strategy({"postgres"}) do
         cluster_listen = "127.0.0.1:9005",
         cluster_telemetry_listen = "127.0.0.1:9006",
         nginx_conf = "spec/fixtures/custom_nginx.template",
+        cluster_rpc = rpc,
+        cluster_rpc_sync = rpc_sync,
       }))
 
       assert(helpers.start_kong({
@@ -50,7 +56,13 @@ for _, strategy in helpers.each_strategy({"postgres"}) do
         cluster_control_plane = "127.0.0.1:9005",
         cluster_telemetry_endpoint = "127.0.0.1:9006",
         proxy_listen = "0.0.0.0:9002",
+        cluster_rpc = rpc,
+        cluster_rpc_sync = rpc_sync,
       }))
+
+      if rpc_sync == "on" then
+        assert.logfile("servroot2/logs/error.log").has.line("[kong.sync.v2] full sync ends", true, 10)
+      end
     end)
 
     lazy_teardown(function()
@@ -120,4 +132,5 @@ for _, strategy in helpers.each_strategy({"postgres"}) do
 
     end)
   end)
-end
+end -- for _, strategy
+end -- for rpc_sync

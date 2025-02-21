@@ -26,13 +26,8 @@ local _M = {
 ---@field name string
 ---@field path string
 
----@class kong.configuration.wasm_filter.meta
----
----@field config_schema kong.db.schema.json.schema_doc|nil
 
-
-local utils = require "kong.tools.utils"
-local dns = require "kong.tools.dns"
+local uuid = require "kong.tools.uuid"
 local reports = require "kong.reports"
 local clear_tab = require "table.clear"
 local cjson = require "cjson.safe"
@@ -48,6 +43,7 @@ local proxy_wasm
 
 local kong = _G.kong
 local ngx = ngx
+local null = ngx.null
 local log = ngx.log
 local DEBUG = ngx.DEBUG
 local ERR = ngx.ERR
@@ -57,6 +53,7 @@ local ipairs = ipairs
 local type = type
 local assert = assert
 local insert = table.insert
+local sort = table.sort
 local cjson_encode = cjson.encode
 local cjson_decode = cjson.decode
 local fmt = string.format
@@ -64,15 +61,33 @@ local fmt = string.format
 
 local VERSION_KEY = "filter_chains:version"
 local TTL_ZERO = { ttl = 0 }
+local GLOBAL_QUERY_OPTS = { workspace = null, show_ws_id = true }
 
 ---@class kong.runloop.wasm.filter_meta
 ---
----@field config_schema table|nil
+---@field config_schema kong.db.schema.json.schema_doc|nil
+---@field metrics table|nil
 
 local FILTER_META_SCHEMA = {
   type = "object",
   properties = {
     config_schema = json_schema.metaschema,
+    metrics = {
+      type = "object",
+      properties = {
+        label_patterns = {
+          type = "array",
+          items = {
+            type = "object",
+            required = { "label", "pattern" },
+            properties = {
+              label = { type = "string" },
+              pattern = { type = "string" },
+            }
+          }
+        }
+      }
+    }
   },
 }
 
@@ -82,7 +97,7 @@ local FILTER_META_SCHEMA = {
 --
 ---@return string
 local function get_version()
-  return kong.core_cache:get(VERSION_KEY, TTL_ZERO, utils.uuid)
+  return kong.core_cache:get(VERSION_KEY, TTL_ZERO, uuid.uuid)
 end
 
 
@@ -102,6 +117,21 @@ local STATUS_ENABLED = "wasm support is enabled"
 local ENABLED = false
 local STATUS = STATUS_DISABLED
 
+local function filter_plugin_compare(a, b)
+  if a.name ~= b.name then
+    return a.name < b.name
+  end
+
+  if a.updated_at and b.updated_at and a.updated_at ~= b.updated_at then
+    return a.updated_at < b.updated_at
+  end
+
+  if a.created_at and b.created_at and a.created_at ~= b.created_at then
+    return a.created_at < b.created_at
+  end
+
+  return a.id < b.id
+end
 
 local hash_chain
 do
@@ -362,6 +392,60 @@ local function build_filter_list(service_chain, route_chain)
 end
 
 
+---@param config any
+---@return string|nil
+local function serialize_configuration(config)
+  -- Serialize all JSON configurations up front
+  --
+  -- NOTE: there is a subtle difference between a raw, non-JSON filter
+  -- configuration which requires no encoding (e.g. `my config bytes`)
+  -- and a JSON filter configuration of type=string, which should be
+  -- JSON-encoded (e.g. `"my config string"`).
+  --
+  -- Properly disambiguating between the two cases requires an
+  -- inspection of the filter metadata, which is not guaranteed to be
+  -- present on data-plane/proxy nodes.
+  if config ~= nil and type(config) ~= "string" then
+    return cjson_encode(config)
+  end
+
+  return config
+end
+
+
+---@param chain kong.db.schema.entities.filter_chain
+local function get_or_insert_chain(chains, chain)
+  local route_id = chain.route and chain.route.id
+  local service_id = chain.service and chain.service.id
+
+  local chain_type = service_id and TYPE_SERVICE or TYPE_ROUTE
+  local id = service_id or route_id
+
+  -- already exists
+  if chains.by_id[chain_type][id] then
+    return chains.by_id[chain_type][id]
+  end
+
+  chains.by_id[chain_type][id] = chain
+
+  if chain_type == TYPE_ROUTE then
+    insert(chains.route_chains, chain)
+  end
+
+  insert(chains.all_chain_refs, {
+    type           = chain_type,
+
+    service_chain  = (chain_type == TYPE_SERVICE and chain) or nil,
+    service_id     = service_id,
+
+    route_chain    = (chain_type == TYPE_ROUTE and chain) or nil,
+    route_id       = route_id,
+  })
+
+  return chain
+end
+
+
 ---
 -- Unconditionally rebuild and return a new wasm state table from the db.
 --
@@ -388,6 +472,15 @@ local function rebuild_state(db, version, old_state)
   ---@type kong.runloop.wasm.filter_chain_reference[]
   local all_chain_refs = {}
 
+  local chains = {
+    all_chain_refs = all_chain_refs,
+    by_id = {
+      [TYPE_SERVICE] = service_chains_by_id,
+      [TYPE_ROUTE] = {},
+    },
+    route_chains = route_chains,
+  }
+
   local page_size = db.filter_chains.max_page_size
 
   for chain, err in db.filter_chains:each(page_size) do
@@ -396,46 +489,46 @@ local function rebuild_state(db, version, old_state)
     end
 
     if chain.enabled then
-      local route_id = chain.route and chain.route.id
-      local service_id = chain.service and chain.service.id
-
-      local chain_type = service_id and TYPE_SERVICE or TYPE_ROUTE
-
       for _, filter in ipairs(chain.filters) do
         if filter.enabled then
-          -- Serialize all JSON configurations up front
-          --
-          -- NOTE: there is a subtle difference between a raw, non-JSON filter
-          -- configuration which requires no encoding (e.g. `my config bytes`)
-          -- and a JSON filter configuration of type=string, which should be
-          -- JSON-encoded (e.g. `"my config string"`).
-          --
-          -- Properly disambiguating between the two cases requires an
-          -- inspection of the filter metadata, which is not guaranteed to be
-          -- present on data-plane/proxy nodes.
-          if filter.config ~= nil and type(filter.config) ~= "string" then
-            filter.config = cjson_encode(filter.config)
-          end
+          filter.config = serialize_configuration(filter.config)
         end
       end
 
-      insert(all_chain_refs, {
-        type           = chain_type,
-
-        service_chain  = (chain_type == TYPE_SERVICE and chain) or nil,
-        service_id     = service_id,
-
-        route_chain    = (chain_type == TYPE_ROUTE and chain) or nil,
-        route_id       = route_id,
-      })
-
-      if chain_type == TYPE_SERVICE then
-        service_chains_by_id[service_id] = chain
-
-      else
-        insert(route_chains, chain)
-      end
+      get_or_insert_chain(chains, chain)
     end
+  end
+
+  local plugin_pagesize = db.plugins.pagination.max_page_size
+
+  local filter_plugins = {}
+
+  for plugin, err in db.plugins:each(plugin_pagesize, GLOBAL_QUERY_OPTS) do
+    if err then
+      return nil, "failed iterating plugins: " .. tostring(err)
+    end
+
+    if _M.filters_by_name[plugin.name] and plugin.enabled then
+      insert(filter_plugins, plugin)
+    end
+  end
+
+  sort(filter_plugins, filter_plugin_compare)
+
+  for _, plugin in ipairs(filter_plugins) do
+    local chain = get_or_insert_chain(chains, {
+      id = uuid.uuid(),
+      enabled = true,
+      route = plugin.route,
+      service = plugin.service,
+      filters = {},
+    })
+
+    insert(chain.filters, {
+      name = plugin.name,
+      enabled = true,
+      config = serialize_configuration(plugin.config),
+    })
   end
 
   local routes = db.routes
@@ -448,28 +541,28 @@ local function rebuild_state(db, version, old_state)
 
   -- locate matching route/service chain entities to build combined
   -- filter chain references
-  for _, rchain in ipairs(route_chains) do
-    local cache_key = routes:cache_key(rchain.route.id)
+  for _, route_chain in ipairs(route_chains) do
+    local cache_key = routes:cache_key(route_chain.route.id)
 
     local route, err = cache:get(cache_key, nil,
-                                 select_route, routes, rchain.route)
+                                 select_route, routes, route_chain.route)
 
     if err then
       return nil, "failed to load route for filter chain " ..
-                  rchain.id .. ": " .. tostring(err)
+                  route_chain.id .. ": " .. tostring(err)
     end
 
     local service_id = route and route.service and route.service.id
-    local schain = service_id and service_chains_by_id[service_id]
+    local service_chain = service_id and service_chains_by_id[service_id]
 
-    if schain then
+    if service_chain then
       insert(all_chain_refs, {
         type           = TYPE_COMBINED,
 
-        service_chain  = schain,
+        service_chain  = service_chain,
         service_id     = service_id,
 
-        route_chain    = rchain,
+        route_chain    = route_chain,
         route_id       = route.id,
       })
     end
@@ -779,12 +872,26 @@ local function register_property_handlers()
     return ok, value, const
   end)
 
+  properties.add_getter("kong.route_name", function(_, _, ctx)
+    local value = ctx.route and ctx.route.name
+    local ok = value ~= nil
+    local const = ok
+    return ok, value, const
+  end)
+
   properties.add_getter("kong.service.response.status", function(kong)
     return true, kong.service.response.get_status(), false
   end)
 
   properties.add_getter("kong.service_id", function(_, _, ctx)
     local value = ctx.service and ctx.service.id
+    local ok = value ~= nil
+    local const = ok
+    return ok, value, const
+  end)
+
+  properties.add_getter("kong.service_name", function(_, _, ctx)
+    local value = ctx.service and ctx.service.name
     local ok = value ~= nil
     local const = ok
     return ok, value, const
@@ -835,12 +942,12 @@ end
 local function enable(kong_config)
   set_available_filters(kong_config.wasm_modules_parsed)
 
-  -- setup a DNS client for ngx_wasm_module
-  _G.dns_client = _G.dns_client or dns(kong_config)
+  if not ngx.IS_CLI then
+    proxy_wasm = proxy_wasm or require "resty.wasmx.proxy_wasm"
+    jit.off(proxy_wasm.set_host_properties_handlers)
 
-  proxy_wasm = proxy_wasm or require "resty.wasmx.proxy_wasm"
-
-  register_property_handlers()
+    register_property_handlers()
+  end
 
   ENABLED = true
   STATUS = STATUS_ENABLED
@@ -887,6 +994,14 @@ end
 function _M.init_worker()
   if not ENABLED then
     return true
+  end
+
+  if not ngx.IS_CLI then
+    _G.dns_client = kong and kong.dns
+
+    if not _G.dns_client then
+      return nil, "global kong.dns client is not initialized"
+    end
   end
 
   local ok, err = update_in_place()
@@ -939,13 +1054,6 @@ function _M.attach(ctx)
       return kong.response.error(500)
     end
   end
-
-  jit.off(proxy_wasm.start)
-  ok, err = proxy_wasm.start()
-  if not ok then
-    log(CRIT, "failed to execute ", chain.label, " filter chain for request: ", err)
-    return kong.response.error(500)
-  end
 end
 
 
@@ -996,6 +1104,38 @@ function _M.status()
   if not ENABLED then
     return nil, STATUS
   end
+
+  return true
+end
+
+function _M.check_enabled_filters()
+  if not ENABLED then
+    return true
+  end
+
+  local enabled_filters = _M.filters_by_name
+
+  local errs
+  for chain, err in kong.db.filter_chains:each() do
+    if err then
+      return nil, err
+    end
+
+    for i, filter in ipairs(chain.filters) do
+      if not enabled_filters[filter.name] then
+        errs = errs or {}
+
+        insert(errs, fmt("filter chain: %s, filter: #%s (%s)",
+                         chain.id, i, filter.name))
+      end
+    end
+  end
+
+  if errs then
+    return nil, "found one or more filter chain entities with filters that are "
+             .. "not enabled/installed:\n" .. table.concat(errs, "\n")
+  end
+
 
   return true
 end

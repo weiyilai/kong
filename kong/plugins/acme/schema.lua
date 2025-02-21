@@ -1,9 +1,7 @@
 local typedefs = require "kong.db.schema.typedefs"
 local reserved_words = require "kong.plugins.acme.reserved_words"
 local redis_schema = require "kong.tools.redis.schema"
-local deprecation = require("kong.deprecation")
-
-local tablex = require "pl.tablex"
+local shallow_copy = require("kong.tools.table").shallow_copy
 
 local CERT_TYPES = { "rsa", "ecc" }
 
@@ -42,44 +40,48 @@ local LEGACY_SCHEMA_TRANSLATIONS = {
   { auth = {
     type = "string",
     len_min = 0,
-    translate_backwards = {'password'},
+    deprecation = {
+      replaced_with = { { path = { 'password' } } },
+      message = "acme: config.storage_config.redis.auth is deprecated, please use config.storage_config.redis.password instead",
+      removal_in_version = "4.0", },
     func = function(value)
-      deprecation("acme: config.storage_config.redis.auth is deprecated, please use config.storage_config.redis.password instead",
-        { after = "4.0", })
       return { password = value }
     end
   }},
   { ssl_server_name = {
     type = "string",
-    translate_backwards = {'server_name'},
+    deprecation = {
+      replaced_with = { { path = { 'server_name' } } },
+      message = "acme: config.storage_config.redis.ssl_server_name is deprecated, please use config.storage_config.redis.server_name instead",
+      removal_in_version = "4.0", },
     func = function(value)
-      deprecation("acme: config.storage_config.redis.ssl_server_name is deprecated, please use config.storage_config.redis.server_name instead",
-        { after = "4.0", })
       return { server_name = value }
     end
   }},
   { namespace = {
     type = "string",
     len_min = 0,
-    translate_backwards = {'extra_options', 'namespace'},
+    deprecation = {
+      replaced_with = { { path = { 'extra_options', 'namespace' } } },
+      message = "acme: config.storage_config.redis.namespace is deprecated, please use config.storage_config.redis.extra_options.namespace instead",
+      removal_in_version = "4.0", },
     func = function(value)
-      deprecation("acme: config.storage_config.redis.namespace is deprecated, please use config.storage_config.redis.extra_options.namespace instead",
-        { after = "4.0", })
       return { extra_options = { namespace = value } }
     end
   }},
   { scan_count = {
     type = "integer",
-    translate_backwards = {'extra_options', 'scan_count'},
+    deprecation = {
+      replaced_with = { { path = { 'extra_options', 'scan_count' } } },
+      message = "acme: config.storage_config.redis.scan_count is deprecated, please use config.storage_config.redis.extra_options.scan_count instead",
+      removal_in_version = "4.0", },
     func = function(value)
-      deprecation("acme: config.storage_config.redis.scan_count is deprecated, please use config.storage_config.redis.extra_options.scan_count instead",
-        { after = "4.0", })
       return { extra_options = { scan_count = value } }
     end
   }},
 }
 
-local REDIS_STORAGE_SCHEMA = tablex.copy(redis_schema.config_schema.fields)
+local REDIS_STORAGE_SCHEMA = shallow_copy(redis_schema.config_schema.fields)
 table.insert(REDIS_STORAGE_SCHEMA, { extra_options = {
   description = "Custom ACME Redis options",
   type = "record",
@@ -187,7 +189,7 @@ local schema = {
           -- Kong doesn't support multiple certificate chains yet
           {
             cert_type = {
-              description = "The certificate type to create. The possible values are `'rsa'` for RSA certificate or `'ecc'` for EC certificate.",
+              description = "The certificate type to create. The possible values are `rsa` for RSA certificate or `ecc` for EC certificate.",
               type = "string",
               default = 'rsa',
               one_of = CERT_TYPES,
@@ -225,7 +227,7 @@ local schema = {
           },
           {
             storage = {
-              description = "The backend storage type to use. The possible values are `'kong'`, `'shm'`, `'redis'`, `'consul'`, or `'vault'`. In DB-less mode, `'kong'` storage is unavailable. Note that `'shm'` storage does not persist during Kong restarts and does not work for Kong running on different machines, so consider using one of `'kong'`, `'redis'`, `'consul'`, or `'vault'` in production. Please refer to the Hybrid Mode sections below as well.",
+              description = "The backend storage type to use. In DB-less mode and Konnect, `kong` storage is unavailable. In hybrid mode and Konnect, `shm` storage is unavailable. `shm` storage does not persist during Kong restarts and does not work for Kong running on different machines, so consider using one of `kong`, `redis`, `consul`, or `vault` in production.",
               type = "string",
               default = "shm",
               one_of = STORAGE_TYPES,

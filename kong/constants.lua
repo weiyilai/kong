@@ -42,6 +42,8 @@ local plugins = {
   "ai-prompt-guard",
   "ai-request-transformer",
   "ai-response-transformer",
+  "standard-webhooks",
+  "redirect"
 }
 
 local plugin_map = {}
@@ -205,8 +207,11 @@ local constants = {
   PROTOCOLS = protocols,
   PROTOCOLS_WITH_SUBSYSTEM = protocols_with_subsystem,
 
+  DECLARATIVE_DEFAULT_WORKSPACE_ID = "0dc6f45b-8f8d-40d2-a504-473544ee190b",
+
   DECLARATIVE_LOAD_KEY = "declarative_config:loaded",
   DECLARATIVE_HASH_KEY = "declarative_config:hash",
+  DECLARATIVE_DEFAULT_WORKSPACE_KEY = "declarative_config:default_workspace",
   PLUGINS_REBUILD_COUNTER_KEY = "readiness_probe_config:plugins_rebuild_counter",
   ROUTERS_REBUILD_COUNTER_KEY = "readiness_probe_config:routers_rebuild_counter",
   DECLARATIVE_EMPTY_CONFIG_HASH = string.rep("0", 32),
@@ -226,9 +231,11 @@ local constants = {
   CLUSTERING_OCSP_TIMEOUT = 5000, -- 5 seconds
   CLUSTERING_DATA_PLANE_ERROR = {
     CONFIG_PARSE     = "declarative configuration parse failure",
+    DELTAS_PARSE     = "sync deltas parse failure",
     RELOAD           = "configuration reload failed",
     GENERIC          = "generic or unknown error",
   },
+  CLUSTERING_DATA_PLANES_LATEST_VERSION_KEY = "clustering_data_planes:latest_version",
 
   CLEAR_HEALTH_STATUS_DELAY = 300, -- 300 seconds
 
@@ -256,6 +263,7 @@ local constants = {
 
   DYN_LOG_LEVEL_KEY = "kong:dyn_log_level",
   DYN_LOG_LEVEL_TIMEOUT_AT_KEY = "kong:dyn_log_level_timeout_at",
+  DYN_LOG_LEVEL_DEFAULT_TIMEOUT = 60,
 
   ADMIN_GUI_KCONFIG_CACHE_KEY = "admin:gui:kconfig",
 
@@ -277,7 +285,18 @@ local constants = {
       exit = "kong",
       service = "upstream",
     }
-  }
+  },
+
+  SOCKET_DIRECTORY = "sockets",
+  SOCKETS = {
+    WORKER_EVENTS = "we",
+    STREAM_WORKER_EVENTS = "sw",
+    CLUSTER_PROXY_SSL_TERMINATOR = "cp",
+    STREAM_CONFIG = "sc",
+    STREAM_TLS_TERMINATE = "st",
+    STREAM_TLS_PASSTHROUGH = "sp",
+    STREAM_RPC = "rp",
+  },
 }
 
 for _, v in ipairs(constants.CLUSTERING_SYNC_STATUS) do

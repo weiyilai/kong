@@ -2,7 +2,8 @@ local pl_pretty = require("pl.pretty").write
 local pl_keys = require("pl.tablex").keys
 local nkeys = require("table.nkeys")
 local table_isarray = require("table.isarray")
-local utils = require("kong.tools.utils")
+local uuid = require("kong.tools.uuid")
+local json = require("kong.tools.cjson")
 
 
 local type         = type
@@ -21,6 +22,7 @@ local concat       = table.concat
 local sort         = table.sort
 local insert       = table.insert
 local remove       = table.remove
+local new_array    = json.new_array
 
 
 local sorted_keys = function(tbl)
@@ -53,6 +55,8 @@ local ERRORS              = {
   INVALID_WORKSPACE       = 17, -- strategy reports a workspace error
   INVALID_UNIQUE_GLOBAL   = 18, -- unique field value is invalid for global query
   REFERENCED_BY_OTHERS    = 19, -- still referenced by other entities
+  INVALID_SEARCH_QUERY    = 20, -- ex. searched_field[unknown] = something -> 'unknown' is invalid (HTTP 400)
+  SYNC_DELTAS             = 21, -- error parsing sync deltas for sync.v2
 }
 
 
@@ -79,6 +83,8 @@ local ERRORS_NAMES                 = {
   [ERRORS.INVALID_WORKSPACE]       = "invalid workspace",
   [ERRORS.INVALID_UNIQUE_GLOBAL]   = "invalid global query",
   [ERRORS.REFERENCED_BY_OTHERS]    = "referenced by others",
+  [ERRORS.INVALID_SEARCH_QUERY]    = "invalid search query",
+  [ERRORS.SYNC_DELTAS]             = "invalid sync deltas",
 }
 
 
@@ -498,6 +504,17 @@ function _M:declarative_config(err_t)
 end
 
 
+function _M:sync_deltas(err_t)
+  if type(err_t) ~= "table" then
+    error("err_t must be a table", 2)
+  end
+
+  local message = fmt("sync deltas is invalid: %s", pl_pretty(err_t, ""))
+
+  return new_err_t(self, ERRORS.SYNC_DELTAS, message, err_t)
+end
+
+
 function _M:invalid_workspace(ws_id)
   if type(ws_id) ~= "string" then
     error("ws_id must be a string", 2)
@@ -720,7 +737,7 @@ do
   ---@param ns?        string
   ---@param flattened? table
   local function categorize_errors(errs, ns, flattened)
-    flattened = flattened or {}
+    flattened = flattened or new_array()
 
     for field, err in drain(errs) do
       local errtype = type(err)
@@ -757,7 +774,7 @@ do
   ---@return string|nil
   local function validate_id(id)
     return (type(id) == "string"
-            and utils.is_valid_uuid(id)
+            and uuid.is_valid_uuid(id)
             and id)
            or nil
   end
@@ -795,12 +812,19 @@ do
   ---@param err_t       table
   ---@param flattened   table
   local function add_entity_errors(entity_type, entity, err_t, flattened)
-    if type(err_t) ~= "table" or nkeys(err_t) == 0 then
+    local err_type = type(err_t)
+
+    -- promote error strings to `@entity` type errors
+    if err_type == "string" then
+      err_t = { ["@entity"] = err_t }
+
+    elseif err_type ~= "table" or nkeys(err_t) == 0 then
       return
+    end
 
     -- this *should* be unreachable, but it's relatively cheap to guard against
     -- compared to everything else we're doing in this code path
-    elseif type(entity) ~= "table" then
+    if type(entity) ~= "table" then
       log(WARN, "could not parse ", entity_type, " errors for non-table ",
                 "input: '", tostring(entity), "'")
       return
@@ -1013,7 +1037,7 @@ do
   ---@param  input table
   ---@return table
   function flatten_errors(input, err_t)
-    local flattened = {}
+    local flattened = new_array()
 
     for entity_type, section_errors in drain(err_t) do
       if type(section_errors) ~= "table" then
@@ -1033,13 +1057,7 @@ do
       for i, err_t_i in drain(section_errors) do
         local entity = entities[i]
 
-
-        -- promote error strings to `@entity` type errors
-        if type(err_t_i) == "string" then
-          err_t_i = { ["@entity"] = err_t_i }
-        end
-
-        if type(entity) == "table" and type(err_t_i) == "table" then
+        if type(entity) == "table" then
           add_entity_errors(entity_type, entity, err_t_i, flattened)
 
         else
@@ -1165,6 +1183,32 @@ function _M:declarative_config_flattened(err_t, input)
   err_t.flattened_errors = flattened
 
   return err_t
+end
+
+
+-- traverse schema validation errors and correlate them with objects/entities
+-- which does not pass delta validation for sync.v2
+--
+---@param  err_t table
+---@param  err_entities table
+---@return table
+function _M:sync_deltas_flattened(err_t, err_entities)
+  if type(err_t) ~= "table" then
+    error("err_t must be a table", 2)
+  end
+
+  if type(err_entities) ~= "table" then
+    error("err_entities is nil or not a table", 2)
+  end
+
+  local flattened = flatten_errors(err_entities, err_t)
+
+  err_t = self:sync_deltas(err_t)
+
+  err_t.flattened_errors = flattened
+
+  return err_t
+
 end
 
 

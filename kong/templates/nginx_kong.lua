@@ -23,11 +23,16 @@ lua_shared_dict kong_db_cache               ${{MEM_CACHE_SIZE}};
 lua_shared_dict kong_db_cache_miss          12m;
 lua_shared_dict kong_secrets                5m;
 
+> if new_dns_client then
+lua_shared_dict kong_dns_cache              ${{RESOLVER_MEM_CACHE_SIZE}};
+> end
+
 underscores_in_headers on;
 > if ssl_cipher_suite == 'old' then
 lua_ssl_conf_command CipherString DEFAULT:@SECLEVEL=0;
 proxy_ssl_conf_command CipherString DEFAULT:@SECLEVEL=0;
 ssl_conf_command CipherString DEFAULT:@SECLEVEL=0;
+grpc_ssl_conf_command CipherString DEFAULT:@SECLEVEL=0;
 > end
 > if ssl_ciphers then
 ssl_ciphers ${{SSL_CIPHERS}};
@@ -37,6 +42,8 @@ ssl_ciphers ${{SSL_CIPHERS}};
 > for _, el in ipairs(nginx_http_directives) do
 $(el.name) $(el.value);
 > end
+
+uninitialized_variable_warn  off;
 
 init_by_lua_block {
 > if test and coverage then
@@ -63,12 +70,12 @@ log_format kong_log_format '$remote_addr - $remote_user [$time_local] '
 
 # Load variable indexes
 lua_kong_load_var_index default;
-lua_kong_load_var_index $http_x_kong_request_debug;
-lua_kong_load_var_index $http_x_kong_request_debug_token;
-lua_kong_load_var_index $http_x_kong_request_debug_log;
 
 upstream kong_upstream {
     server 0.0.0.1;
+> if upstream_keepalive_pool_size > 0 then
+    balancer_keepalive ${{UPSTREAM_KEEPALIVE_POOL_SIZE}};
+> end
 
     # injected nginx_upstream_* directives
 > for _, el in ipairs(nginx_upstream_directives) do
@@ -122,6 +129,9 @@ server {
     ssl_certificate_by_lua_block {
         Kong.ssl_certificate()
     }
+    ssl_client_hello_by_lua_block {
+        Kong.ssl_client_hello()
+    }
 > end
 
     # injected nginx_proxy_* directives
@@ -157,6 +167,7 @@ server {
 
         set $ctx_ref                     '';
         set $upstream_te                 '';
+        set $upstream_via                '';
         set $upstream_host               '';
         set $upstream_upgrade            '';
         set $upstream_connection         '';
@@ -180,6 +191,7 @@ server {
 > end
 
         proxy_set_header      TE                 $upstream_te;
+        proxy_set_header      Via                $upstream_via;
         proxy_set_header      Host               $upstream_host;
         proxy_set_header      Upgrade            $upstream_upgrade;
         proxy_set_header      Connection         $upstream_connection;
@@ -214,6 +226,7 @@ server {
         proxy_request_buffering off;
 
         proxy_set_header      TE                 $upstream_te;
+        proxy_set_header      Via                $upstream_via;
         proxy_set_header      Host               $upstream_host;
         proxy_set_header      Upgrade            $upstream_upgrade;
         proxy_set_header      Connection         $upstream_connection;
@@ -248,6 +261,7 @@ server {
         proxy_request_buffering off;
 
         proxy_set_header      TE                 $upstream_te;
+        proxy_set_header      Via                $upstream_via;
         proxy_set_header      Host               $upstream_host;
         proxy_set_header      Upgrade            $upstream_upgrade;
         proxy_set_header      Connection         $upstream_connection;
@@ -282,6 +296,7 @@ server {
         proxy_request_buffering  on;
 
         proxy_set_header      TE                 $upstream_te;
+        proxy_set_header      Via                $upstream_via;
         proxy_set_header      Host               $upstream_host;
         proxy_set_header      Upgrade            $upstream_upgrade;
         proxy_set_header      Connection         $upstream_connection;
@@ -312,6 +327,7 @@ server {
         set $kong_proxy_mode 'grpc';
 
         grpc_set_header      TE                 $upstream_te;
+        grpc_set_header      Via                $upstream_via;
         grpc_set_header      X-Forwarded-For    $upstream_x_forwarded_for;
         grpc_set_header      X-Forwarded-Proto  $upstream_x_forwarded_proto;
         grpc_set_header      X-Forwarded-Host   $upstream_x_forwarded_host;
@@ -339,14 +355,16 @@ server {
         set $kong_proxy_mode 'http';
 
         rewrite_by_lua_block       {
-          -- ngx.localtion.capture will create a new nginx request,
+          -- ngx.location.capture will create a new nginx request,
           -- so the upstream ssl-related info attached to the `r` gets lost.
           -- we need to re-set them here to the new nginx request.
           local ctx = ngx.ctx
           local upstream_ssl = require("kong.runloop.upstream_ssl")
+          local upstream_retry = require("kong.runloop.upstream_retry")
 
           upstream_ssl.set_service_ssl(ctx)
           upstream_ssl.fallback_upstream_client_cert(ctx)
+          upstream_retry.fallback_proxy_next_upstream()
         }
         access_by_lua_block        {;}
         header_filter_by_lua_block {;}
@@ -355,6 +373,7 @@ server {
 
         proxy_http_version 1.1;
         proxy_set_header      TE                 $upstream_te;
+        proxy_set_header      Via                $upstream_via;
         proxy_set_header      Host               $upstream_host;
         proxy_set_header      Upgrade            $upstream_upgrade;
         proxy_set_header      Connection         $upstream_connection;
@@ -381,9 +400,8 @@ server {
 
     location = /kong_error_handler {
         internal;
-        default_type                 '';
 
-        uninitialized_variable_warn  off;
+        default_type                 '';
 
         rewrite_by_lua_block {;}
         access_by_lua_block  {;}
@@ -568,13 +586,21 @@ server {
             Kong.serve_cluster_listener()
         }
     }
+
+> if cluster_rpc then
+    location = /v2/outlet {
+        content_by_lua_block {
+            Kong.serve_cluster_rpc_listener()
+        }
+    }
+> end -- cluster_rpc is enabled
 }
 > end -- role == "control_plane"
 
 server {
     charset UTF-8;
     server_name kong_worker_events;
-    listen unix:${{PREFIX}}/worker_events.sock;
+    listen unix:${{SOCKET_PATH}}/${{WORKER_EVENTS_SOCK}};
     access_log off;
     location / {
         content_by_lua_block {

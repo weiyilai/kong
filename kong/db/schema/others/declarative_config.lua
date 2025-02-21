@@ -1,5 +1,5 @@
 local uuid = require("resty.jit-uuid")
-local utils = require("kong.tools.utils")
+local kong_table = require("kong.tools.table")
 local Errors = require("kong.db.errors")
 local Entity = require("kong.db.schema.entity")
 local Schema = require("kong.db.schema")
@@ -7,12 +7,14 @@ local constants = require("kong.constants")
 local plugin_loader = require("kong.db.schema.plugin_loader")
 local vault_loader = require("kong.db.schema.vault_loader")
 local schema_topological_sort = require("kong.db.schema.topological_sort")
+local utils_uuid = require("kong.tools.uuid").uuid
 
 
 local null = ngx.null
 local type = type
 local next = next
 local pairs = pairs
+local fmt = string.format
 local yield = require("kong.tools.yield").yield
 local ipairs = ipairs
 local insert = table.insert
@@ -38,15 +40,41 @@ local foreign_references = {}
 local foreign_children = {}
 
 
-function DeclarativeConfig.pk_string(schema, object)
-  if #schema.primary_key == 1 then
-    return tostring(object[schema.primary_key[1]])
-  else
-    local out = {}
-    for _, k in ipairs(schema.primary_key) do
-      insert(out, tostring(object[k]))
+do
+  local tb_nkeys = require("table.nkeys")
+  local buffer = require("string.buffer")
+
+  -- Generate a stable and unique string key from primary key defined inside
+  -- schema, supports both non-composite and composite primary keys
+  function DeclarativeConfig.pk_string(schema, object)
+    local primary_key = schema.primary_key
+    local count = tb_nkeys(primary_key)
+
+    if count == 1 then
+      return tostring(object[primary_key[1]])
     end
-    return concat(out, ":")
+
+    local buf = buffer.new()
+
+    -- The logic comes from get_cache_key_value(), which uses `id` directly to
+    -- extract foreign key.
+    -- TODO: extract primary key recursively using pk_string(), KAG-5750
+    for i = 1, count do
+      local k = primary_key[i]
+      local v = object[k]
+
+      if type(v) == "table" and schema.fields[k].type == "foreign" then
+        v = v.id
+      end
+
+      buf:put(tostring(v or ""))
+
+      if i < count then
+        buf:put(":")
+      end
+    end
+
+    return buf:get()
   end
 end
 
@@ -99,7 +127,7 @@ local function add_top_level_entities(fields, known_entities)
   local records = {}
 
   for _, entity in ipairs(known_entities) do
-    local definition = utils.cycle_aware_deep_copy(all_schemas[entity], true)
+    local definition = kong_table.cycle_aware_deep_copy(all_schemas[entity], true)
 
     for k, _ in pairs(definition.fields) do
       if type(k) ~= "number" then
@@ -132,7 +160,7 @@ end
 
 
 local function copy_record(record, include_foreign, duplicates, name, cycle_aware_cache)
-  local copy = utils.cycle_aware_deep_copy(record, true, nil, cycle_aware_cache)
+  local copy = kong_table.cycle_aware_deep_copy(record, true, nil, cycle_aware_cache)
   if include_foreign then
     return copy
   end
@@ -304,7 +332,7 @@ end
 
 
 local function ws_id_for(item)
-  if item.ws_id == nil or item.ws_id == ngx.null then
+  if item.ws_id == nil or item.ws_id == null then
     return "*"
   end
   return item.ws_id
@@ -334,8 +362,24 @@ local function uniqueness_error_msg(entity, key, value)
          "with " .. key .. " set to '" .. value .. "' already declared"
 end
 
+local function add_error(errs, parent_entity, parent_idx, entity, entity_idx, err)
+  if parent_entity and parent_idx then
+    errs[parent_entity]                     = errs[parent_entity] or {}
+    errs[parent_entity][parent_idx]         = errs[parent_entity][parent_idx] or {}
+    errs[parent_entity][parent_idx][entity] = errs[parent_entity][parent_idx][entity] or {}
 
-local function populate_references(input, known_entities, by_id, by_key, expected, errs, parent_entity)
+    -- e.g. errs["upstreams"][5]["targets"][2]
+    errs[parent_entity][parent_idx][entity][entity_idx] = err
+
+  else
+    errs[entity] = errs[entity] or {}
+
+    -- e.g. errs["consumers"][3]
+    errs[entity][entity_idx] = err
+  end
+end
+
+local function populate_references(input, known_entities, by_id, by_key, expected, errs, parent_entity, parent_idx)
   for _, entity in ipairs(known_entities) do
     yield(true)
 
@@ -349,7 +393,8 @@ local function populate_references(input, known_entities, by_id, by_key, expecte
     local child_key
     if parent_entity then
       local parent_schema = all_schemas[parent_entity]
-      if parent_schema.fields[entity] then
+      local entity_field = parent_schema.fields[entity]
+      if entity_field and not entity_field.transient then
         goto continue
       end
       parent_fk = parent_schema:extract_pk_values(input)
@@ -363,17 +408,17 @@ local function populate_references(input, known_entities, by_id, by_key, expecte
     for i, item in ipairs(input[entity]) do
       yield(true)
 
-      populate_references(item, known_entities, by_id, by_key, expected, errs, entity)
+      populate_references(item, known_entities, by_id, by_key, expected, errs, entity, i)
 
       local item_id = DeclarativeConfig.pk_string(entity_schema, item)
       local key = use_key and item[endpoint_key]
 
       local failed = false
-      if key and key ~= ngx.null then
+      if key and key ~= null then
         local ok = add_to_by_key(by_key, entity_schema, item, entity, key)
         if not ok then
-          errs[entity] = errs[entity] or {}
-          errs[entity][i] = uniqueness_error_msg(entity, endpoint_key, key)
+          add_error(errs, parent_entity, parent_idx, entity, i,
+                    uniqueness_error_msg(entity, endpoint_key, key))
           failed = true
         end
       end
@@ -381,8 +426,9 @@ local function populate_references(input, known_entities, by_id, by_key, expecte
       if item_id then
         by_id[entity] = by_id[entity] or {}
         if (not failed) and by_id[entity][item_id] then
-          errs[entity] = errs[entity] or {}
-          errs[entity][i] = uniqueness_error_msg(entity, "primary key", item_id)
+          add_error(errs, parent_entity, parent_idx, entity, i,
+                    uniqueness_error_msg(entity, "primary key", item_id))
+
         else
           by_id[entity][item_id] = item
           table.insert(by_id[entity], item_id)
@@ -406,7 +452,7 @@ local function populate_references(input, known_entities, by_id, by_key, expecte
       end
 
       if parent_fk then
-        item[child_key] = utils.cycle_aware_deep_copy(parent_fk, true)
+        item[child_key] = kong_table.cycle_aware_deep_copy(parent_fk, true)
       end
     end
 
@@ -458,6 +504,72 @@ local function validate_references(self, input)
   end
 
   return by_id, by_key
+end
+
+
+-- TODO: Completely implement validate_references_sync without associating it
+-- to declarative config. Currently, we will use the dc-generated
+-- foreign_references table to accelerate iterating over entity foreign keys.
+function DeclarativeConfig.validate_references_sync(deltas, deltas_map, is_full_sync)
+  local errs = {}
+
+  for _, delta in ipairs(deltas) do
+    local item_type = delta.type
+    local item = delta.entity
+
+    local foreign_refs = foreign_references[item_type]
+
+    if not item or item == null or not foreign_refs then
+      goto continue
+    end
+
+    local ws_id = item.ws_id or delta.ws_id or kong.default_workspace
+
+    for k, v in pairs(item) do
+
+      -- Try to check if item's some foreign key exists in the deltas or LMDB.
+      -- For example, `item[k]` could be `<router_entity>["service"]`, we need
+      -- to find the referenced foreign service entity for this router entity.
+
+      local foreign_entity = foreign_refs[k]
+
+      if foreign_entity and v ~= null then  -- k is foreign key
+
+        local dao = kong.db[foreign_entity]
+
+        -- try to find it in deltas
+        local pks = DeclarativeConfig.pk_string(dao.schema, v)
+        local fvalue = deltas_map[pks]
+
+        -- try to find it in DB (LMDB)
+        if not fvalue and not is_full_sync then
+          fvalue = dao:select(v, { workspace = ws_id })
+        end
+
+        -- record an error if not finding its foreign reference
+        if not fvalue then
+          errs[item_type] = errs[item_type] or {}
+          errs[item_type][foreign_entity] = errs[item_type][foreign_entity] or {}
+
+          local msg = fmt("could not find %s's foreign references %s (%s)",
+                          item_type, foreign_entity,
+                          type(v) == "string" and v or cjson_encode(v))
+
+          insert(errs[item_type][foreign_entity], msg)
+        end
+      end  -- if foreign_entity and v ~= null
+
+    end  -- for k, v in pairs(item)
+
+    ::continue::
+  end  -- for _, delta in ipairs(deltas)
+
+
+  if next(errs) then
+    return nil, errs
+  end
+
+  return true
 end
 
 
@@ -581,7 +693,7 @@ local function generate_ids(input, known_entities, parent_entity)
     local child_key
     if parent_entity then
       local parent_schema = all_schemas[parent_entity]
-      if parent_schema.fields[entity] then
+      if parent_schema.fields[entity] and not parent_schema.fields[entity].transient then
         goto continue
       end
       parent_fk = parent_schema:extract_pk_values(input)
@@ -593,7 +705,7 @@ local function generate_ids(input, known_entities, parent_entity)
       local pk_name, key = get_key_for_uuid_gen(entity, item, schema,
                                                 parent_fk, child_key)
       if key then
-        item = utils.cycle_aware_deep_copy(item, true)
+        item = kong_table.cycle_aware_deep_copy(item, true)
         item[pk_name] = generate_uuid(schema.name, key)
         input[entity][i] = item
       end
@@ -618,7 +730,7 @@ local function populate_ids_for_validation(input, known_entities, parent_entity,
     local child_key
     if parent_entity then
       local parent_schema = all_schemas[parent_entity]
-      if parent_schema.fields[entity] then
+      if parent_schema.fields[entity] and not parent_schema.fields[entity].transient then
         goto continue
       end
       parent_fk = parent_schema:extract_pk_values(input)
@@ -633,7 +745,7 @@ local function populate_ids_for_validation(input, known_entities, parent_entity,
         if key then
           item[pk_name] = generate_uuid(schema.name, key)
         else
-          item[pk_name] = utils.uuid()
+          item[pk_name] = utils_uuid()
         end
       end
 
@@ -652,7 +764,7 @@ local function populate_ids_for_validation(input, known_entities, parent_entity,
       end
 
       if parent_fk and not item[child_key] then
-        item[child_key] = utils.cycle_aware_deep_copy(parent_fk, true)
+        item[child_key] = kong_table.cycle_aware_deep_copy(parent_fk, true)
       end
     end
 
@@ -708,7 +820,7 @@ end
 
 
 local function insert_default_workspace_if_not_given(_, entities)
-  local default_workspace = find_default_ws(entities) or "0dc6f45b-8f8d-40d2-a504-473544ee190b"
+  local default_workspace = find_default_ws(entities) or constants.DECLARATIVE_DEFAULT_WORKSPACE_ID
 
   if not entities.workspaces then
     entities.workspaces = {}
@@ -756,11 +868,11 @@ local function flatten(self, input)
       self.full_schema = DeclarativeConfig.load(self.plugin_set, self.vault_set, true)
     end
 
-    local input_copy = utils.cycle_aware_deep_copy(input, true)
+    local input_copy = kong_table.cycle_aware_deep_copy(input, true)
     populate_ids_for_validation(input_copy, self.known_entities)
     local ok2, err2 = self.full_schema:validate(input_copy)
     if not ok2 then
-      local err3 = utils.cycle_aware_deep_merge(err2, extract_null_errors(err))
+      local err3 = kong_table.cycle_aware_deep_merge(err2, extract_null_errors(err))
       return nil, err3
     end
 
@@ -815,7 +927,7 @@ local function flatten(self, input)
 
         if field.unique then
           local flat_value = flat_entry[name]
-          if flat_value and flat_value ~= ngx.null then
+          if flat_value and flat_value ~= null then
             local unique_key = get_unique_key(schema, entry, field, flat_value)
             uniques[name] = uniques[name] or {}
             if uniques[name][unique_key] then

@@ -1,5 +1,5 @@
 local constants = require("kong.constants")
-local hostname_type = require("kong.tools.utils").hostname_type
+local hostname_type = require("kong.tools.ip").hostname_type
 local normalize = require("kong.tools.uri").normalize
 
 
@@ -104,12 +104,18 @@ local function check_select_params(req_method, req_uri, req_host, req_scheme,
 end
 
 
-local function add_debug_headers(var, header, match_t)
-  if not var.http_kong_debug then
+local get_header
+if ngx.config.subsystem == "http" then
+  get_header = require("kong.tools.http").get_header
+end
+
+
+local function add_debug_headers(ctx, header, match_t)
+  if not kong.configuration.allow_debug_header then
     return
   end
-
-  if not kong.configuration.allow_debug_header then
+  
+  if not get_header("kong_debug", ctx) then
     return
   end
 
@@ -389,39 +395,6 @@ do
 end
 
 
-local parse_ip_addr
-do
-  local bit = require("bit")
-  local ipmatcher = require("resty.ipmatcher")
-
-  local band, lshift, rshift = bit.band, bit.lshift, bit.rshift
-
-  parse_ip_addr = function(ip)
-    local addr, mask = ipmatcher.split_ip(ip)
-
-    if not mask then
-      return addr
-    end
-
-    local ipv4 = ipmatcher.parse_ipv4(addr)
-
-    -- FIXME: support ipv6
-    if not ipv4 then
-      return addr, mask
-    end
-
-    local cidr = lshift(rshift(ipv4, 32 - mask), 32 - mask)
-
-    local n1 = band(       cidr     , 0xff)
-    local n2 = band(rshift(cidr,  8), 0xff)
-    local n3 = band(rshift(cidr, 16), 0xff)
-    local n4 = band(rshift(cidr, 24), 0xff)
-
-    return n4 .. "." .. n3 .. "." .. n2 .. "." .. n1, mask
-  end
-end
-
-
 return {
   DEFAULT_MATCH_LRUCACHE_SIZE  = DEFAULT_MATCH_LRUCACHE_SIZE,
 
@@ -435,6 +408,4 @@ return {
   route_match_stat     = route_match_stat,
   is_regex_magic       = is_regex_magic,
   phonehome_statistics = phonehome_statistics,
-
-  parse_ip_addr        = parse_ip_addr,
 }

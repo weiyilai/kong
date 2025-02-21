@@ -1,7 +1,7 @@
 #!/bin/bash -e
 
 # template variables starts
-luarocks_exec="{{@luarocks//:luarocks_exec}}"
+luarocks_exec="{{@@luarocks//:luarocks_exec}}"
 # template variables ends
 
 if [[ "$OSTYPE" == "darwin"* ]]; then
@@ -15,7 +15,7 @@ mkdir -p $(dirname $@)
 # alias LDOC command to true(1) command
 export LDOC=true
 
-$luarocks_exec make --no-doc 2>&1 >$@.tmp
+$luarocks_exec make --no-doc >$@.tmp 2>&1
 
 # only generate the output when the command succeeds
 mv $@.tmp $@

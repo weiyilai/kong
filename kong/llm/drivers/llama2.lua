@@ -108,11 +108,12 @@ end
 local function to_raw(request_table, model)
   local messages = {}
   messages.parameters = {}
-  messages.parameters.max_new_tokens = model.options and model.options.max_tokens
-  messages.parameters.top_p = model.options and model.options.top_p or 1.0
-  messages.parameters.top_k = model.options and model.options.top_k or 40
-  messages.parameters.temperature = model.options and model.options.temperature
-  
+  messages.parameters.max_new_tokens = request_table.max_tokens
+  messages.parameters.top_p = request_table.top_p
+  messages.parameters.top_k = request_table.top_k
+  messages.parameters.temperature = request_table.temperature
+  messages.parameters.stream = request_table.stream or false  -- explicitly set this
+
   if request_table.prompt and request_table.messages then
     return kong.response.exit(400, "cannot run raw 'prompt' and chat history 'messages' requests at the same time - refer to schema")
 
@@ -133,6 +134,8 @@ local transformers_from = {
   ["llm/v1/completions/raw"] = from_raw,
   ["llm/v1/chat/ollama"] = ai_shared.from_ollama,
   ["llm/v1/completions/ollama"] = ai_shared.from_ollama,
+  ["stream/llm/v1/chat/ollama"] = ai_shared.from_ollama,
+  ["stream/llm/v1/completions/ollama"] = ai_shared.from_ollama,
 }
 
 local transformers_to = {
@@ -155,18 +158,21 @@ function _M.from_format(response_string, model_info, route_type)
   if not transformers_from[transformer_type] then
     return nil, fmt("no transformer available from format %s://%s", model_info.provider, transformer_type)
   end
-  
-  local ok, response_string, err = pcall(
+
+  local ok, response_string, err, metadata = pcall(
     transformers_from[transformer_type],
     response_string,
     model_info,
     route_type
   )
-  if not ok or err then
+  if not ok then
+    err = response_string
+  end
+  if err then
     return nil, fmt("transformation failed from type %s://%s: %s", model_info.provider, route_type, err or "unexpected_error")
   end
 
-  return response_string, nil
+  return response_string, nil, metadata
 end
 
 function _M.to_format(request_table, model_info, route_type)
@@ -175,6 +181,8 @@ function _M.to_format(request_table, model_info, route_type)
   if model_info.options.llama2_format == "openai" then
     return openai_driver.to_format(request_table, model_info, route_type)
   end
+
+  request_table = ai_shared.merge_config_defaults(request_table, model_info.options, model_info.route_type)
 
   -- dynamically call the correct transformer
   local ok, response_object, content_type, err = pcall(
@@ -217,13 +225,13 @@ function _M.subrequest(body, conf, http_opts, return_res_table)
     headers[conf.auth.header_name] = conf.auth.header_value
   end
 
-  local res, err = ai_shared.http_request(url, body_string, method, headers, http_opts)
+  local res, err, httpc = ai_shared.http_request(url, body_string, method, headers, http_opts, return_res_table)
   if err then
     return nil, nil, "request to ai service failed: " .. err
   end
 
   if return_res_table then
-    return res, res.status, nil
+    return res, res.status, nil, httpc
   else
     -- At this point, the entire request / response is complete and the connection
     -- will be closed or back on the connection pool.
@@ -251,11 +259,6 @@ function _M.post_request(conf)
 end
 
 function _M.pre_request(conf, body)
-  -- check for user trying to bring own model
-  if body and body.model then
-    return false, "cannot use own model for this instance"
-  end
-
   return true, nil
 end
 
@@ -263,9 +266,14 @@ end
 function _M.configure_request(conf)
   local parsed_url = socket_url.parse(conf.model.options.upstream_url)
 
+  ai_shared.override_upstream_url(parsed_url, conf)
+
+  -- if the path is read from a URL capture, ensure that it is valid
+  parsed_url.path = (parsed_url.path and string_gsub(parsed_url.path, "^/*", "/")) or "/"
+
   kong.service.request.set_path(parsed_url.path)
   kong.service.request.set_scheme(parsed_url.scheme)
-  kong.service.set_target(parsed_url.host, tonumber(parsed_url.port))
+  kong.service.set_target(parsed_url.host, (tonumber(parsed_url.port) or 443))
 
   local auth_header_name = conf.auth and conf.auth.header_name
   local auth_header_value = conf.auth and conf.auth.header_value
@@ -274,13 +282,18 @@ function _M.configure_request(conf)
   local auth_param_location = conf.auth and conf.auth.param_location
 
   if auth_header_name and auth_header_value then
-    kong.service.request.set_header(auth_header_name, auth_header_value)
+    local exist_value = kong.request.get_header(auth_header_name)
+    if exist_value == nil or not conf.auth.allow_override then
+      kong.service.request.set_header(auth_header_name, auth_header_value)
+    end
   end
 
   if auth_param_name and auth_param_value and auth_param_location == "query" then
     local query_table = kong.request.get_query()
-    query_table[auth_param_name] = auth_param_value
-    kong.service.request.set_query(query_table)
+    if query_table[auth_param_name] == nil or not conf.auth.allow_override then
+      query_table[auth_param_name] = auth_param_value
+      kong.service.request.set_query(query_table)
+    end
   end
 
   -- if auth_param_location is "form", it will have already been set in a pre-request hook

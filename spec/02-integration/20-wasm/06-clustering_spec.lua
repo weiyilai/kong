@@ -1,5 +1,4 @@
 local helpers = require "spec.helpers"
-local utils = require "kong.tools.utils"
 local cjson = require "cjson.safe"
 local STATUS = require("kong.constants").CLUSTERING_SYNC_STATUS
 local admin = require "spec.fixtures.admin_api"
@@ -10,6 +9,8 @@ local FILTER_SRC = "spec/fixtures/proxy_wasm_filters/build/response_transformer.
 
 local json = cjson.encode
 local file = helpers.file
+local random_string = require("kong.tools.rand").random_string
+local uuid = require("kong.tools.uuid").uuid
 
 
 local function expect_status(id, exp)
@@ -71,12 +72,16 @@ local function new_wasm_filter_directory()
 end
 
 
-describe("#wasm - hybrid mode #postgres", function()
+for _, v in ipairs({ {"off", "off"}, {"on", "off"}, {"on", "on"}, }) do
+  local rpc, rpc_sync = v[1], v[2]
+
+describe("#wasm - hybrid mode #postgres" .. " rpc_sync=" .. rpc_sync, function()
   local cp_prefix = "cp"
   local cp_errlog = cp_prefix .. "/logs/error.log"
   local cp_filter_path
 
   local dp_prefix = "dp"
+  local dp_errlog = dp_prefix .. "/logs/error.log"
 
   lazy_setup(function()
     helpers.clean_prefix(cp_prefix)
@@ -108,8 +113,18 @@ describe("#wasm - hybrid mode #postgres", function()
       cluster_listen      = "127.0.0.1:9005",
       nginx_conf          = "spec/fixtures/custom_nginx.template",
       wasm                = true,
+      wasm_filters        = "user", -- don't enable bundled filters for this test
       wasm_filters_path   = cp_filter_path,
+      nginx_main_worker_processes = 2,
+      cluster_rpc         = rpc,
+      cluster_rpc_sync    = rpc_sync,
     }))
+
+    assert.logfile(cp_errlog).has.line([[successfully loaded "response_transformer" module]], true, 10)
+    assert.logfile(cp_errlog).has.no.line("[error]", true, 0)
+    assert.logfile(cp_errlog).has.no.line("[alert]", true, 0)
+    assert.logfile(cp_errlog).has.no.line("[crit]",  true, 0)
+    assert.logfile(cp_errlog).has.no.line("[emerg]", true, 0)
   end)
 
   lazy_teardown(function()
@@ -126,7 +141,7 @@ describe("#wasm - hybrid mode #postgres", function()
 
     lazy_setup(function()
       dp_filter_path = new_wasm_filter_directory()
-      node_id = utils.uuid()
+      node_id = uuid()
 
       assert(helpers.start_kong({
         role                  = "data_plane",
@@ -138,9 +153,19 @@ describe("#wasm - hybrid mode #postgres", function()
         admin_listen          = "off",
         nginx_conf            = "spec/fixtures/custom_nginx.template",
         wasm                  = true,
+        wasm_filters          = "user", -- don't enable bundled filters for this test
         wasm_filters_path     = dp_filter_path,
         node_id               = node_id,
+        nginx_main_worker_processes = 2,
+        cluster_rpc           = rpc,
+        cluster_rpc_sync      = rpc_sync,
       }))
+
+      assert.logfile(dp_errlog).has.line([[successfully loaded "response_transformer" module]], true, 10)
+      assert.logfile(dp_errlog).has.no.line("[error]", true, 0)
+      assert.logfile(dp_errlog).has.no.line("[alert]", true, 0)
+      assert.logfile(dp_errlog).has.no.line("[crit]",  true, 0)
+      assert.logfile(dp_errlog).has.no.line("[emerg]", true, 0)
 
       client = helpers.proxy_client()
     end)
@@ -155,7 +180,7 @@ describe("#wasm - hybrid mode #postgres", function()
 
     it("syncs wasm filter chains to the data plane", function()
       local service = admin.services:insert({})
-      local host = "wasm-" .. utils.random_string() .. ".test"
+      local host = "wasm-" .. random_string() .. ".test"
 
       admin.routes:insert({
         service = service,
@@ -179,7 +204,7 @@ describe("#wasm - hybrid mode #postgres", function()
         end)
         .is_truthy("service/route are ready on the data plane")
 
-      local value = utils.random_string()
+      local value = random_string()
 
       local filter = admin.filter_chains:insert({
         service = { id = service.id },
@@ -215,7 +240,7 @@ describe("#wasm - hybrid mode #postgres", function()
           res:read_body()
 
           if res.status ~= 200 then
-            return {
+            return nil, {
               msg = "bad http status",
               exp = 200,
               got = res.status,
@@ -247,7 +272,7 @@ describe("#wasm - hybrid mode #postgres", function()
           res:read_body()
 
           if res.status ~= 200 then
-            return {
+            return nil, {
               msg = "bad http status",
               exp = 200,
               got = res.status,
@@ -271,12 +296,15 @@ describe("#wasm - hybrid mode #postgres", function()
     end)
   end)
 
-  describe("data planes with wasm disabled", function()
+  -- XXX TODO: currently sync v2 does not support configuration compatibility check
+  local only_sync_v1 = rpc_sync == "on" and pending or describe
+
+  only_sync_v1("data planes with wasm disabled", function()
     local node_id
 
     lazy_setup(function()
       helpers.clean_logfile(cp_errlog)
-      node_id = utils.uuid()
+      node_id = uuid()
 
       assert(helpers.start_kong({
         role                  = "data_plane",
@@ -289,6 +317,8 @@ describe("#wasm - hybrid mode #postgres", function()
         nginx_conf            = "spec/fixtures/custom_nginx.template",
         wasm                  = "off",
         node_id               = node_id,
+        cluster_rpc           = rpc,
+        cluster_rpc_sync      = rpc_sync,
       }))
     end)
 
@@ -306,14 +336,14 @@ describe("#wasm - hybrid mode #postgres", function()
     end)
   end)
 
-  describe("data planes missing one or more wasm filter", function()
+  only_sync_v1("data planes missing one or more wasm filter", function()
     local tmp_dir
     local node_id
 
     lazy_setup(function()
       helpers.clean_logfile(cp_errlog)
       tmp_dir = helpers.make_temp_dir()
-      node_id = utils.uuid()
+      node_id = uuid()
 
       assert(helpers.start_kong({
         role                  = "data_plane",
@@ -325,8 +355,11 @@ describe("#wasm - hybrid mode #postgres", function()
         admin_listen          = "off",
         nginx_conf            = "spec/fixtures/custom_nginx.template",
         wasm                  = true,
+        wasm_filters          = "user", -- don't enable bundled filters for this test
         wasm_filters_path     = tmp_dir,
         node_id               = node_id,
+        cluster_rpc           = rpc,
+        cluster_rpc_sync      = rpc_sync,
       }))
     end)
 
@@ -345,3 +378,4 @@ describe("#wasm - hybrid mode #postgres", function()
     end)
   end)
 end)
+end -- for rpc_sync

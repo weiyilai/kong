@@ -11,6 +11,9 @@ local getmetatable  = getmetatable
 local _M = {}
 
 
+_M.EMPTY = require("pl.tablex").readonly({})
+
+
 --- packs a set of arguments in a table.
 -- Explicitly sets field `n` to the number of arguments, so it is `nil` safe
 _M.pack = function(...) return {n = select("#", ...), ...} end
@@ -36,6 +39,29 @@ function _M.table_merge(t1, t2)
   if t2 then
     for k,v in pairs(t2) do
       res[k] = v
+    end
+  end
+  return res
+end
+
+
+--- Merges two table together but does not replace values from `t1` if `t2` for a given key has `ngx.null` value
+-- A new table is created with a non-recursive copy of the provided tables
+-- @param t1 The first table
+-- @param t2 The second table
+-- @return The (new) merged table
+function _M.null_aware_table_merge(t1, t2)
+  local res = {}
+  if t1 then
+    for k,v in pairs(t1) do
+      res[k] = v
+    end
+  end
+  if t2 then
+    for k,v in pairs(t2) do
+      if res[k] == nil or v ~= ngx.null then
+        res[k] = v
+      end
     end
   end
   return res
@@ -307,10 +333,10 @@ function _M.add_error(errors, k, v)
   return errors
 end
 
+
 --- Retrieves a value from table using path.
 -- @param t The source table to retrieve the value from.
 -- @param path Path table containing keys
--- @param v Value of the error
 -- @return Returns `value` if something was found and `nil` otherwise
 function _M.table_path(t, path)
   local current_value = t
@@ -324,5 +350,6 @@ function _M.table_path(t, path)
 
   return current_value
 end
+
 
 return _M

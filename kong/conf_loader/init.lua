@@ -4,20 +4,24 @@ local require = require
 local kong_default_conf = require "kong.templates.kong_defaults"
 local process_secrets = require "kong.cmd.utils.process_secrets"
 local pl_stringio = require "pl.stringio"
-local pl_stringx = require "pl.stringx"
 local socket_url = require "socket.url"
 local conf_constants = require "kong.conf_loader.constants"
 local listeners = require "kong.conf_loader.listeners"
+local conf_sys = require "kong.conf_loader.sys"
 local conf_parse = require "kong.conf_loader.parse"
+local nginx_signals = require "kong.cmd.utils.nginx_signals"
 local pl_pretty = require "pl.pretty"
 local pl_config = require "pl.config"
 local pl_file = require "pl.file"
 local pl_path = require "pl.path"
 local tablex = require "pl.tablex"
-local utils = require "kong.tools.utils"
 local log = require "kong.cmd.utils.log"
 local env = require "kong.cmd.utils.env"
-local ffi = require "ffi"
+local constants = require "kong.constants"
+
+
+local cycle_aware_deep_copy = require("kong.tools.table").cycle_aware_deep_copy
+local strip = require("kong.tools.string").strip
 
 
 local fmt = string.format
@@ -26,8 +30,8 @@ local type = type
 local sort = table.sort
 local find = string.find
 local gsub = string.gsub
-local strip = pl_stringx.strip
 local lower = string.lower
+local upper = string.upper
 local match = string.match
 local pairs = pairs
 local assert = assert
@@ -35,21 +39,16 @@ local unpack = unpack
 local ipairs = ipairs
 local insert = table.insert
 local remove = table.remove
-local getenv = os.getenv
 local exists = pl_path.exists
 local abspath = pl_path.abspath
 local tostring = tostring
 local setmetatable = setmetatable
 
 
-local C = ffi.C
-
-
-ffi.cdef([[
-  struct group *getgrnam(const char *name);
-  struct passwd *getpwnam(const char *name);
-  int unsetenv(const char *name);
-]])
+local getgrnam = conf_sys.getgrnam
+local getpwnam = conf_sys.getpwnam
+local getenv   = conf_sys.getenv
+local unsetenv = conf_sys.unsetenv
 
 
 local get_phase = conf_parse.get_phase
@@ -140,7 +139,7 @@ local function load_config(thing)
     -- remove trailing comment, if any
     -- and remove escape chars from octothorpes
     if value then
-      value = ngx.re.sub(value, [[\s*(?<!\\)#.*$]], "")
+      value = ngx.re.sub(value, [[\s*(?<!\\)#.*$]], "", "jo")
       value = gsub(value, "\\#", "#")
     end
     return value
@@ -171,11 +170,12 @@ local function load_config_file(path)
 end
 
 --- Get available Wasm filters list
--- @param[type=string] Path where Wasm filters are stored.
+---@param filters_path string # Path where Wasm filters are stored.
+---@return kong.configuration.wasm_filter[]
 local function get_wasm_filters(filters_path)
   local wasm_filters = {}
 
-  if filters_path then
+  if filters_path and pl_path.isdir(filters_path) then
     local filter_files = {}
     for entry in pl_path.dir(filters_path) do
       local pathname = pl_path.join(filters_path, entry)
@@ -183,11 +183,12 @@ local function get_wasm_filters(filters_path)
         filter_files[pathname] = pathname
 
         local extension = pl_path.extension(entry)
-        if string.lower(extension) == ".wasm" then
+        if lower(extension) == ".wasm" then
           insert(wasm_filters, {
             name = entry:sub(0, -#extension - 1),
             path = pathname,
           })
+
         else
           log.debug("ignoring file ", entry, " in ", filters_path, ": does not contain wasm suffix")
         end
@@ -314,7 +315,7 @@ local function load(path, custom_conf, opts)
         return nil, err
       end
 
-      for k, v in pairs(env_vars) do
+      for k in pairs(env_vars) do
         local kong_var = match(lower(k), "^kong_(.+)")
         if kong_var then
           -- the value will be read in `overrides()`
@@ -361,7 +362,7 @@ local function load(path, custom_conf, opts)
   -- remove the unnecessary fields if we are still at the very early stage
   -- before executing the main `resty` cmd, i.e. still in `bin/kong`
   if opts.pre_cmd then
-    for k, v in pairs(conf) do
+    for k in pairs(conf) do
       if not conf_constants.CONF_BASIC[k] then
         conf[k] = nil
       end
@@ -397,67 +398,138 @@ local function load(path, custom_conf, opts)
 
     loaded_vaults = setmetatable(vaults, conf_constants._NOP_TOSTRING_MT)
 
-    if get_phase() == "init" then
-      local secrets = getenv("KONG_PROCESS_SECRETS")
-      if secrets then
-        C.unsetenv("KONG_PROCESS_SECRETS")
+    -- collect references
+    local is_reference = require "kong.pdk.vault".is_reference
+    for k, v in pairs(conf) do
+      local typ = (conf_constants.CONF_PARSERS[k] or {}).typ
+      v = parse_value(v, typ == "array" and "array" or "string")
+      if typ == "array" then
+        local found
 
-      else
-        local path = pl_path.join(abspath(ngx.config.prefix()), unpack(conf_constants.PREFIX_PATHS.kong_process_secrets))
-        if exists(path) then
-          secrets, err = pl_file.read(path, true)
-          pl_file.delete(path)
-          if not secrets then
-            return nil, fmt("failed to read process secrets file: %s", err)
+        for i, r in ipairs(v) do
+          if is_reference(r) then
+            found = true
+            if not refs then
+              refs = setmetatable({}, conf_constants._NOP_TOSTRING_MT)
+            end
+            if not refs[k] then
+              refs[k] = {}
+            end
+            refs[k][i] = r
           end
         end
-      end
 
-      if secrets then
-        secrets, err = process_secrets.deserialize(secrets, path)
-        if not secrets then
-          return nil, err
+        if found then
+          conf[k] = v
         end
 
-        for k, deref in pairs(secrets) do
-          local v = parse_value(conf[k], "string")
-          if refs then
-            refs[k] = v
-          else
-            refs = setmetatable({ [k] = v }, conf_constants._NOP_TOSTRING_MT)
-          end
-
-          conf[k] = deref
+      elseif is_reference(v) then
+        if not refs then
+          refs = setmetatable({}, conf_constants._NOP_TOSTRING_MT)
         end
+        refs[k] = v
       end
+    end
+
+    local prefix = abspath(conf.prefix or ngx.config.prefix())
+    local secret_env
+    local secret_file
+    local secrets_env_var_name = upper("KONG_PROCESS_SECRETS_" .. ngx.config.subsystem)
+    local secrets = getenv(secrets_env_var_name)
+    if secrets then
+      secret_env = secrets_env_var_name
 
     else
+      local secrets_path = pl_path.join(prefix, unpack(conf_constants.PREFIX_PATHS.kong_process_secrets)) .. "_" .. ngx.config.subsystem
+      if exists(secrets_path) then
+        secrets, err = pl_file.read(secrets_path, true)
+        if not secrets then
+          pl_file.delete(secrets_path)
+          return nil, fmt("failed to read process secrets file: %s", err)
+        end
+        secret_file = secrets_path
+      end
+    end
+
+    if secrets then
+      local env_path = pl_path.join(prefix, unpack(conf_constants.PREFIX_PATHS.kong_env))
+      secrets, err = process_secrets.deserialize(secrets, env_path)
+      if not secrets then
+        return nil, err
+      end
+
+      for k, deref in pairs(secrets) do
+        conf[k] = deref
+      end
+    end
+
+    if get_phase() == "init" then
+      if secrets then
+        if secret_env then
+          unsetenv(secret_env)
+        end
+        if secret_file then
+          pl_file.delete(secret_file)
+        end
+      end
+
+    elseif refs then
       local vault_conf = { loaded_vaults = loaded_vaults }
       for k, v in pairs(conf) do
         if sub(k, 1, 6) == "vault_" then
           vault_conf[k] = parse_value(v, "string")
         end
       end
-
       local vault = require("kong.pdk.vault").new({ configuration = vault_conf })
+      for k, v in pairs(refs) do
+        if type(v) == "table" then
+          for i, r in pairs(v) do
+            local deref, deref_err = vault.get(r)
+            if deref == nil or deref_err then
+              if opts.starting then
+                return nil, fmt("failed to dereference '%s': %s for config option '%s[%d]'", r, deref_err, k, i)
+              end
 
-      for k, v in pairs(conf) do
-        v = parse_value(v, "string")
-        if vault.is_reference(v) then
-          if refs then
-            refs[k] = v
-          else
-            refs = setmetatable({ [k] = v }, conf_constants._NOP_TOSTRING_MT)
+              -- not that fatal if resolving fails during stopping (e.g. missing environment variables)
+              if opts.stopping or opts.pre_cmd then
+                conf[k][i] = "_INVALID_VAULT_KONG_REFERENCE"
+              end
+
+            else
+              conf[k][i] = deref
+            end
           end
 
+        else
           local deref, deref_err = vault.get(v)
           if deref == nil or deref_err then
             if opts.starting then
               return nil, fmt("failed to dereference '%s': %s for config option '%s'", v, deref_err, k)
             end
 
+            -- not that fatal if resolving fails during stopping (e.g. missing environment variables)
+            if opts.stopping or opts.pre_cmd then
+              conf[k] = ""
+              break
+            end
+
           else
             conf[k] = deref
+          end
+        end
+      end
+
+      -- remove invalid references and leave valid ones for
+      -- pre_cmd or non-fatal stopping scenarios
+      -- this adds some robustness if the vault reference is
+      -- inside an array style config field and the config field
+      -- is also needed by vault, for example the `lua_ssl_trusted_certificate`
+      if opts.stopping or opts.pre_cmd then
+        for k, v in pairs(refs) do
+          if type(v) == "table" then
+            conf[k] = setmetatable(tablex.filter(conf[k], function(v)
+              return v ~= "_INVALID_VAULT_KONG_REFERENCE"
+            end), nil)
           end
         end
       end
@@ -466,7 +538,6 @@ local function load(path, custom_conf, opts)
 
   -- validation
   local ok, err, errors = check_and_parse(conf, opts)
-
   if not opts.starting then
     log.enable()
   end
@@ -482,6 +553,18 @@ local function load(path, custom_conf, opts)
 
   -- load absolute paths
   conf.prefix = abspath(conf.prefix)
+
+  -- The socket path is where we store listening unix sockets for IPC and private APIs.
+  -- It is derived from the prefix and is NOT intended to be user-configurable
+  conf.socket_path = pl_path.join(conf.prefix, constants.SOCKET_DIRECTORY)
+  conf.worker_events_sock = constants.SOCKETS.WORKER_EVENTS
+  conf.stream_worker_events_sock = constants.SOCKETS.STREAM_WORKER_EVENTS
+  conf.stream_rpc_sock = constants.SOCKETS.STREAM_RPC
+  conf.stream_config_sock = constants.SOCKETS.STREAM_CONFIG
+  conf.stream_tls_passthrough_sock = constants.SOCKETS.STREAM_TLS_PASSTHROUGH
+  conf.stream_tls_terminate_sock = constants.SOCKETS.STREAM_TLS_TERMINATE
+  conf.cluster_proxy_ssl_terminator_sock = constants.SOCKETS.CLUSTER_PROXY_SSL_TERMINATOR
+
 
   if conf.lua_ssl_trusted_certificate
      and #conf.lua_ssl_trusted_certificate > 0 then
@@ -535,7 +618,7 @@ local function load(path, custom_conf, opts)
     end
   end
 
-  if C.getpwnam("kong") == nil or C.getgrnam("kong") == nil then
+  if getpwnam("kong") == nil or getgrnam("kong") == nil then
     if default_nginx_main_user == true and default_nginx_user == true then
       conf.nginx_user = nil
       conf.nginx_main_user = nil
@@ -547,8 +630,86 @@ local function load(path, custom_conf, opts)
 
   -- Wasm module support
   if conf.wasm then
-    local wasm_filters = get_wasm_filters(conf.wasm_filters_path)
-    conf.wasm_modules_parsed = setmetatable(wasm_filters, conf_constants._NOP_TOSTRING_MT)
+    ---@type table<string, boolean>
+    local allowed_filter_names = {}
+    local all_bundled_filters_enabled = false
+    local all_user_filters_enabled = false
+    local all_filters_disabled = false
+    for _, filter in ipairs(conf.wasm_filters) do
+      if filter == "bundled" then
+        all_bundled_filters_enabled = true
+
+      elseif filter == "user" then
+        all_user_filters_enabled = true
+
+      elseif filter == "off" then
+        all_filters_disabled = true
+
+      else
+        allowed_filter_names[filter] = true
+      end
+    end
+
+    if all_filters_disabled then
+      allowed_filter_names = {}
+      all_bundled_filters_enabled = false
+      all_user_filters_enabled = false
+    end
+
+    ---@type table<string, kong.configuration.wasm_filter>
+    local active_filters_by_name = {}
+
+    local bundled_filter_path = conf_constants.WASM_BUNDLED_FILTERS_PATH
+    if not pl_path.isdir(bundled_filter_path) then
+      local alt_path
+
+      local nginx_bin = nginx_signals.find_nginx_bin(conf)
+      if nginx_bin then
+        alt_path = pl_path.dirname(nginx_bin) .. "/../../../kong/wasm"
+        alt_path = pl_path.normpath(alt_path) or alt_path
+      end
+
+      if alt_path and pl_path.isdir(alt_path) then
+        log.debug("loading bundled proxy-wasm filters from alt path: %s",
+                  alt_path)
+        bundled_filter_path = alt_path
+
+      else
+        log.debug("Bundled proxy-wasm filters path (%s) does not exist " ..
+                 "or is not a directory. Bundled filters may not be " ..
+                 "available", bundled_filter_path)
+      end
+    end
+
+    conf.wasm_bundled_filters_path = bundled_filter_path
+    local bundled_filters = get_wasm_filters(bundled_filter_path)
+    for _, filter in ipairs(bundled_filters) do
+      if all_bundled_filters_enabled or allowed_filter_names[filter.name] then
+        active_filters_by_name[filter.name] = filter
+      end
+    end
+
+    local user_filters = get_wasm_filters(conf.wasm_filters_path)
+    for _, filter in ipairs(user_filters) do
+      if all_user_filters_enabled or allowed_filter_names[filter.name] then
+        if active_filters_by_name[filter.name] then
+          log.warn("Replacing bundled filter %s with a user-supplied " ..
+                   "filter at %s", filter.name, filter.path)
+        end
+        active_filters_by_name[filter.name] = filter
+      end
+    end
+
+    ---@type kong.configuration.wasm_filter[]
+    local active_filters = {}
+    for _, filter in pairs(active_filters_by_name) do
+      insert(active_filters, filter)
+    end
+    sort(active_filters, function(lhs, rhs)
+      return lhs.name < rhs.name
+    end)
+
+    conf.wasm_modules_parsed = setmetatable(active_filters, conf_constants._NOP_TOSTRING_MT)
 
     local function add_wasm_directive(directive, value, prefix)
       local directive_name = (prefix or "") .. directive
@@ -564,6 +725,12 @@ local function load(path, custom_conf, opts)
     -- _also_ enabled. We inject it here if the user has not opted to set it
     -- themselves.
     add_wasm_directive("nginx_http_proxy_wasm_lua_resolver", "on")
+
+    -- configure wasmtime module cache
+    if conf.role == "traditional" or conf.role == "data_plane" then
+      conf.wasmtime_cache_directory = pl_path.join(conf.prefix, ".wasmtime_cache")
+      conf.wasmtime_cache_config_file = pl_path.join(conf.prefix, ".wasmtime_config.toml")
+    end
 
     -- wasm vm properties are inherited from previously set directives
     if conf.lua_ssl_trusted_certificate and #conf.lua_ssl_trusted_certificate >= 1 then
@@ -622,12 +789,14 @@ local function load(path, custom_conf, opts)
     local conf_arr = {}
 
     for k, v in pairs(conf) do
-      local to_print = v
-      if conf_constants.CONF_SENSITIVE[k] then
-        to_print = conf_constants.CONF_SENSITIVE_PLACEHOLDER
-      end
+      if k ~= "$refs" then
+        local to_print = v
+        if conf_constants.CONF_SENSITIVE[k] then
+          to_print = conf_constants.CONF_SENSITIVE_PLACEHOLDER
+        end
 
-      conf_arr[#conf_arr+1] = k .. " = " .. pl_pretty.write(to_print, "")
+        conf_arr[#conf_arr+1] = k .. " = " .. pl_pretty.write(to_print, "")
+      end
     end
 
     sort(conf_arr)
@@ -656,6 +825,14 @@ local function load(path, custom_conf, opts)
             plugins[plugin_name] = true
           end
         end
+      end
+    end
+
+    if conf.wasm_modules_parsed then
+      for _, filter in ipairs(conf.wasm_modules_parsed) do
+        assert(plugins[filter.name] == nil,
+               "duplicate plugin/wasm filter name: " .. filter.name)
+        plugins[filter.name] = true
       end
     end
 
@@ -839,9 +1016,13 @@ local function load(path, custom_conf, opts)
   -- to make it suitable to be used as an origin in headers, we need to
   -- parse and reconstruct the admin_gui_url to ensure it only contains
   -- the scheme, host, and port
-  if conf.admin_gui_url then
-    local parsed_url = socket_url.parse(conf.admin_gui_url)
-    conf.admin_gui_origin = parsed_url.scheme .. "://" .. parsed_url.authority
+  if conf.admin_gui_url and #conf.admin_gui_url > 0 then
+    local admin_gui_origin = {}
+    for _, url in ipairs(conf.admin_gui_url) do
+      local parsed_url = socket_url.parse(url)
+      table.insert(admin_gui_origin, parsed_url.scheme .. "://" .. parsed_url.authority)
+    end
+    conf.admin_gui_origin = admin_gui_origin
   end
 
   -- hybrid mode HTTP tunneling (CONNECT) proxy inside HTTPS
@@ -851,6 +1032,55 @@ local function load(path, custom_conf, opts)
     if parsed.scheme == "https" then
       conf.cluster_ssl_tunnel = fmt("%s:%s", parsed.host, parsed.port or 443)
     end
+  end
+
+  if conf.cluster_rpc_sync and not conf.cluster_rpc then
+    log.warn("Cluster rpc sync has been forcibly disabled, " ..
+             "please enable cluster RPC.")
+    conf.cluster_rpc_sync = false
+  end
+
+  -- parse and validate pluginserver directives
+  if conf.pluginserver_names then
+    local pluginservers = {}
+    for i, name in ipairs(conf.pluginserver_names) do
+      name = name:lower()
+      local env_prefix = "pluginserver_" .. name:gsub("-", "_")
+      local socket = conf[env_prefix .. "_socket"] or (conf.prefix .. "/" .. name .. ".socket")
+
+      local start_command = conf[env_prefix .. "_start_cmd"]
+      local query_command = conf[env_prefix .. "_query_cmd"]
+
+      local default_path = exists(conf_constants.DEFAULT_PLUGINSERVER_PATH .. "/" .. name)
+
+      if not start_command and default_path then
+        start_command = default_path
+      end
+
+      if not query_command and default_path then
+        query_command = default_path .. " -dump"
+      end
+
+      -- query_command is required
+      if not query_command then
+        return nil, "query_command undefined for pluginserver " .. name
+      end
+
+      -- if start_command is unset, we assume the pluginserver process is
+      -- managed externally
+      if not start_command then
+        log.warn("start_command undefined for pluginserver " .. name .. "; assuming external process management")
+      end
+
+      pluginservers[i] = {
+        name = name,
+        socket = socket,
+        start_command = start_command,
+        query_command = query_command,
+      }
+    end
+
+    conf.pluginservers = setmetatable(pluginservers, conf_constants._NOP_TOSTRING_MT)
   end
 
   -- initialize the dns client, so the globally patched tcp.connect method
@@ -871,7 +1101,7 @@ return setmetatable({
   end,
 
   remove_sensitive = function(conf)
-    local purged_conf = utils.cycle_aware_deep_copy(conf)
+    local purged_conf = cycle_aware_deep_copy(conf)
 
     local refs = purged_conf["$refs"]
     if type(refs) == "table" then

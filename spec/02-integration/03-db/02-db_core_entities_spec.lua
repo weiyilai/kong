@@ -1,6 +1,6 @@
 local Errors = require "kong.db.errors"
 local defaults = require "kong.db.strategies.connector".defaults
-local utils = require "kong.tools.utils"
+local uuid = require "kong.tools.uuid"
 local helpers = require "spec.helpers"
 local cjson = require "cjson"
 local ssl_fixtures = require "spec.fixtures.ssl"
@@ -86,6 +86,11 @@ for _, strategy in helpers.each_strategy() do
         end)
 
         describe("pagination options", function()
+          it("default page_size and max_page_size", function()
+            assert.equal(db.routes.pagination.page_size, 1000)
+            assert.equal(db.routes.pagination.max_page_size, 50000)
+          end)
+
           it("errors on invalid page size", function()
             local ok, err, err_t = db.routes:page(nil, nil, {
               pagination = {
@@ -604,7 +609,7 @@ for _, strategy in helpers.each_strategy() do
         end)
 
         it("cannot insert if foreign primary_key is invalid", function()
-          local fake_id = utils.uuid()
+          local fake_id = uuid.uuid()
           local credentials, _, err_t = db.basicauth_credentials:insert({
             username = "peter",
             password = "pan",
@@ -618,7 +623,7 @@ for _, strategy in helpers.each_strategy() do
 
         -- I/O
         it("cannot insert if foreign Service does not exist", function()
-          local u = utils.uuid()
+          local u = uuid.uuid()
           local service = {
             id = u
           }
@@ -687,7 +692,7 @@ for _, strategy in helpers.each_strategy() do
           assert.is_table(route)
           assert.is_number(route.created_at)
           assert.is_number(route.updated_at)
-          assert.is_true(utils.is_valid_uuid(route.id))
+          assert.is_true(uuid.is_valid_uuid(route.id))
 
           assert.same({
             id              = route.id,
@@ -731,7 +736,7 @@ for _, strategy in helpers.each_strategy() do
           assert.is_table(route)
           assert.is_number(route.created_at)
           assert.is_number(route.updated_at)
-          assert.is_true(utils.is_valid_uuid(route.id))
+          assert.is_true(uuid.is_valid_uuid(route.id))
 
           assert.same({
             id              = route.id,
@@ -773,7 +778,7 @@ for _, strategy in helpers.each_strategy() do
           assert.is_table(route)
           assert.is_number(route.created_at)
           assert.is_number(route.updated_at)
-          assert.is_true(utils.is_valid_uuid(route.id))
+          assert.is_true(uuid.is_valid_uuid(route.id))
 
           assert.same({
             id              = route.id,
@@ -985,7 +990,7 @@ for _, strategy in helpers.each_strategy() do
 
         -- I/O
         it("return nothing on non-existing Route", function()
-          local route, err, err_t = db.routes:select({ id = utils.uuid() })
+          local route, err, err_t = db.routes:select({ id = uuid.uuid() })
           assert.is_nil(route)
           assert.is_nil(err_t)
           assert.is_nil(err)
@@ -1060,7 +1065,7 @@ for _, strategy in helpers.each_strategy() do
 
         -- I/O
         it("returns not found error", function()
-          local pk = { id = utils.uuid() }
+          local pk = { id = uuid.uuid() }
           local new_route, err, err_t = db.routes:update(pk, {
             protocols = { "https" },
             hosts = { "example.com" },
@@ -1274,7 +1279,7 @@ for _, strategy in helpers.each_strategy() do
 
         -- I/O
         it("returns nothing if the Route does not exist", function()
-          local u = utils.uuid()
+          local u = uuid.uuid()
           local ok, err, err_t = db.routes:delete({
             id = u
           })
@@ -1354,7 +1359,7 @@ for _, strategy in helpers.each_strategy() do
           assert.is_table(service)
           assert.is_number(service.created_at)
           assert.is_number(service.updated_at)
-          assert.is_true(utils.is_valid_uuid(service.id))
+          assert.is_true(uuid.is_valid_uuid(service.id))
 
           assert.same({
             id                 = service.id,
@@ -1401,7 +1406,7 @@ for _, strategy in helpers.each_strategy() do
           assert.is_table(service)
           assert.is_number(service.created_at)
           assert.is_number(service.updated_at)
-          assert.is_true(utils.is_valid_uuid(service.id))
+          assert.is_true(uuid.is_valid_uuid(service.id))
 
           assert.same({
             id                 = service.id,
@@ -1601,7 +1606,7 @@ for _, strategy in helpers.each_strategy() do
         -- I/O
         it("returns nothing on non-existing Service", function()
           local service, err, err_t = db.services:select({
-            id = utils.uuid()
+            id = uuid.uuid()
           })
           assert.is_nil(err_t)
           assert.is_nil(err)
@@ -1682,7 +1687,7 @@ for _, strategy in helpers.each_strategy() do
 
         -- I/O
         it("returns not found error", function()
-          local pk = { id = utils.uuid() }
+          local pk = { id = uuid.uuid() }
           local service, err, err_t = db.services:update(pk, { protocol = "http" })
           assert.is_nil(service)
           local message = fmt(
@@ -1863,7 +1868,7 @@ for _, strategy in helpers.each_strategy() do
 
         -- I/O
         it("returns nothing if the Service does not exist", function()
-          local u = utils.uuid()
+          local u = uuid.uuid()
           local ok, err, err_t = db.services:delete({
             id = u
           })
@@ -2010,7 +2015,7 @@ for _, strategy in helpers.each_strategy() do
 
       it(":update() cannot attach a Route to a non-existing Service", function()
         local service = {
-          id = utils.uuid()
+          id = uuid.uuid()
         }
 
         local route = bp.routes:insert({
