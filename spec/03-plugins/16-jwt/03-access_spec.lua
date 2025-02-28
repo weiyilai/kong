@@ -2,7 +2,7 @@ local cjson       = require "cjson"
 local helpers     = require "spec.helpers"
 local fixtures    = require "spec.03-plugins.16-jwt.fixtures"
 local jwt_encoder = require "kong.plugins.jwt.jwt_parser"
-local utils       = require "kong.tools.utils"
+local uuid        = require "kong.tools.uuid"
 
 
 local PAYLOAD = {
@@ -22,10 +22,17 @@ for _, strategy in helpers.each_strategy() do
     local rsa_jwt_secret_3
     local rsa_jwt_secret_4
     local rsa_jwt_secret_5
+    local rsa_jwt_secret_6
+    local rsa_jwt_secret_7
+    local rsa_jwt_secret_8
+    local rsa_jwt_secret_9
+    local rsa_jwt_secret_10
+    local rsa_jwt_secret_11
     local hs_jwt_secret_1
     local hs_jwt_secret_2
     local proxy_client
     local admin_client
+    local nonexisting_anonymous = uuid.uuid() -- a nonexisting consumer id
 
     lazy_setup(function()
       local bp = helpers.get_db_utils(strategy, {
@@ -66,6 +73,12 @@ for _, strategy in helpers.each_strategy() do
       local consumer8      = consumers:insert({ username = "jwt_tests_hs_consumer_8" })
       local consumer9      = consumers:insert({ username = "jwt_tests_rsa_consumer_9" })
       local consumer10     = consumers:insert({ username = "jwt_tests_rsa_consumer_10"})
+      local consumer11     = consumers:insert({ username = "jwt_tests_rsa_consumer_11"})
+      local consumer12     = consumers:insert({ username = "jwt_tests_rsa_consumer_12"})
+      local consumer13     = consumers:insert({ username = "jwt_tests_rsa_consumer_13"})
+      local consumer14     = consumers:insert({ username = "jwt_tests_rsa_consumer_14"})
+      local consumer15     = consumers:insert({ username = "jwt_tests_rsa_consumer_15"})
+      local consumer16     = consumers:insert({ username = "jwt_tests_rsa_consumer_16"})
       local anonymous_user = consumers:insert({ username = "no-body" })
 
       local plugins = bp.plugins
@@ -109,7 +122,7 @@ for _, strategy in helpers.each_strategy() do
       plugins:insert({
         name     = "jwt",
         route = { id = routes[7].id },
-        config   = { anonymous = utils.uuid() },
+        config   = { anonymous = nonexisting_anonymous }, -- a nonexisting consumer id
       })
 
       plugins:insert({
@@ -121,7 +134,10 @@ for _, strategy in helpers.each_strategy() do
       plugins:insert({
         name     = "jwt",
         route = { id = routes[9].id },
-        config   = { cookie_names = { "silly", "crumble" } },
+        config   = {
+          cookie_names = { "silly", "crumble" },
+          realm = "test-jwt"
+        },
       })
 
       plugins:insert({
@@ -168,8 +184,6 @@ for _, strategy in helpers.each_strategy() do
                      ctx_check_field = "authenticated_jwt_token" },
       })
 
-
-
       jwt_secret        = bp.jwt_secrets:insert { consumer = { id = consumer1.id } }
       jwt_secret_2      = bp.jwt_secrets:insert { consumer = { id = consumer6.id } }
       base64_jwt_secret = bp.jwt_secrets:insert { consumer = { id = consumer2.id } }
@@ -203,6 +217,42 @@ for _, strategy in helpers.each_strategy() do
         algorithm      = "ES384",
         rsa_public_key = fixtures.es384_public_key
       }
+
+      rsa_jwt_secret_6 = bp.jwt_secrets:insert {
+        consumer       = { id = consumer11.id },
+        algorithm      = "ES512",
+        rsa_public_key = fixtures.es512_public_key
+      }
+
+      rsa_jwt_secret_7 = bp.jwt_secrets:insert {
+        consumer       = { id = consumer12.id },
+        algorithm      = "PS256",
+        rsa_public_key = fixtures.ps256_public_key
+      }
+
+      rsa_jwt_secret_8 = bp.jwt_secrets:insert {
+        consumer       = { id = consumer13.id },
+        algorithm      = "PS384",
+        rsa_public_key = fixtures.ps384_public_key
+      }
+
+      rsa_jwt_secret_9 = bp.jwt_secrets:insert {
+        consumer       = { id = consumer14.id },
+        algorithm      = "PS512",
+        rsa_public_key = fixtures.ps512_public_key
+      }
+
+      rsa_jwt_secret_10 = bp.jwt_secrets:insert {
+        consumer       = { id = consumer15.id },
+        algorithm      = "EdDSA",
+        rsa_public_key = fixtures.ed25519_public_key
+      }      
+
+      rsa_jwt_secret_11 = bp.jwt_secrets:insert {
+        consumer       = { id = consumer16.id },
+        algorithm      = "EdDSA",
+        rsa_public_key = fixtures.ed448_public_key
+      }      
 
       hs_jwt_secret_1 = bp.jwt_secrets:insert {
         consumer       = { id = consumer7.id },
@@ -252,6 +302,7 @@ for _, strategy in helpers.each_strategy() do
           }
         })
         assert.res_status(401, res)
+        assert.equal('Bearer', res.headers["WWW-Authenticate"])
       end)
       it("returns 401 if the claims do not contain the key to identify a secret", function()
         PAYLOAD.iss = nil
@@ -268,6 +319,7 @@ for _, strategy in helpers.each_strategy() do
         local body = assert.res_status(401, res)
         local json = cjson.decode(body)
         assert.same({ message = "No mandatory 'iss' in claims" }, json)
+        assert.equal('Bearer error="invalid_token"', res.headers["WWW-Authenticate"])
       end)
       it("returns 401 if the claims do not contain a valid key to identify a secret", function()
         PAYLOAD.iss = ""
@@ -284,6 +336,7 @@ for _, strategy in helpers.each_strategy() do
         local body = assert.res_status(401, res)
         local json = cjson.decode(body)
         assert.same({ message = "Invalid 'iss' in claims" }, json)
+        assert.equal('Bearer error="invalid_token"', res.headers["WWW-Authenticate"])
       end)
       it("returns 401 Unauthorized if the iss does not match a credential", function()
         PAYLOAD.iss = "123456789"
@@ -300,6 +353,7 @@ for _, strategy in helpers.each_strategy() do
         local body = assert.res_status(401, res)
         local json = cjson.decode(body)
         assert.same({ message = "No credentials found for given 'iss'" }, json)
+        assert.equal('Bearer error="invalid_token"', res.headers["WWW-Authenticate"])
       end)
       it("returns 401 Unauthorized if the signature is invalid", function()
         PAYLOAD.iss = jwt_secret.key
@@ -316,6 +370,7 @@ for _, strategy in helpers.each_strategy() do
         local body = assert.res_status(401, res)
         local json = cjson.decode(body)
         assert.same({ message = "Invalid signature" }, json)
+        assert.equal('Bearer error="invalid_token"', res.headers["WWW-Authenticate"])
       end)
       it("returns 401 Unauthorized if the alg does not match the credential", function()
         local header = {typ = "JWT", alg = 'RS256'}
@@ -332,6 +387,7 @@ for _, strategy in helpers.each_strategy() do
         local body = assert.res_status(401, res)
         local json = cjson.decode(body)
         assert.same({ message = "Invalid algorithm" }, json)
+        assert.equal('Bearer error="invalid_token"', res.headers["WWW-Authenticate"])
       end)
       it("returns 200 on OPTIONS requests if run_on_preflight is false", function()
         local res = assert(proxy_client:send {
@@ -353,6 +409,7 @@ for _, strategy in helpers.each_strategy() do
         })
         local body = assert.res_status(401, res)
         assert.equal([[{"message":"Unauthorized"}]], body)
+        assert.equal('Bearer', res.headers["WWW-Authenticate"])
       end)
       it("returns 401 if the token exceeds the maximum allowed expiration limit", function()
         local payload = {
@@ -370,6 +427,7 @@ for _, strategy in helpers.each_strategy() do
         })
         local body = assert.res_status(401, res)
         assert.equal('{"exp":"exceeds maximum allowed expiration"}', body)
+        assert.equal('Bearer error="invalid_token"', res.headers["WWW-Authenticate"])
       end)
       it("accepts a JWT token within the maximum allowed expiration limit", function()
         local payload = {
@@ -410,6 +468,7 @@ for _, strategy in helpers.each_strategy() do
         })
         local body = cjson.decode(assert.res_status(401, res))
         assert.same({ message = "Multiple tokens provided" }, body)
+        assert.equal('Bearer error="invalid_token"', res.headers["WWW-Authenticate"])
       end)
     end)
 
@@ -549,6 +608,7 @@ for _, strategy in helpers.each_strategy() do
         local body = assert.res_status(401, res)
         local json = cjson.decode(body)
         assert.same({ message = "No credentials found for given 'iss'" }, json)
+        assert.equal('Bearer realm="test-jwt" error="invalid_token"', res.headers["WWW-Authenticate"])
       end)
       it("returns a 401 if the JWT in the cookie is corrupted", function()
         PAYLOAD.iss = jwt_secret.key
@@ -563,6 +623,7 @@ for _, strategy in helpers.each_strategy() do
         })
         local body = assert.res_status(401, res)
         assert.equal([[{"message":"Bad token; invalid JSON"}]], body)
+        assert.equal('Bearer realm="test-jwt" error="invalid_token"', res.headers["WWW-Authenticate"])
       end)
       it("reports a 200 without cookies but with a JWT token in the Authorization header", function()
         PAYLOAD.iss = jwt_secret.key
@@ -586,6 +647,7 @@ for _, strategy in helpers.each_strategy() do
           }
         })
         assert.res_status(401, res)
+        assert.equal('Bearer realm="test-jwt"', res.headers["WWW-Authenticate"])
       end)
       it("returns 200 without cookies but with a JWT token in the CustomAuthorization header", function()
         PAYLOAD.iss = jwt_secret.key
@@ -674,6 +736,23 @@ for _, strategy in helpers.each_strategy() do
         assert.equal("jwt_tests_rsa_consumer_2", body.headers["x-consumer-username"])
         assert.equal(rsa_jwt_secret_2.key, body.headers["x-credential-identifier"])
       end)
+      it("proxies the request if conf.secret is base64", function()
+        PAYLOAD.iss = rsa_jwt_secret_2.key
+        local jwt = jwt_encoder.encode(PAYLOAD, fixtures.rs256_private_key, 'RS256')
+        local authorization = "Bearer " .. jwt
+        local res = assert(proxy_client:send {
+          method  = "GET",
+          path    = "/request",
+          headers = {
+            ["Authorization"] = authorization,
+            ["Host"]          = "jwt5.test"
+          }
+        })
+        local body = cjson.decode(assert.res_status(200, res))
+        assert.equal(authorization, body.headers.authorization)
+        assert.equal("jwt_tests_rsa_consumer_2", body.headers["x-consumer-username"])
+        assert.equal(rsa_jwt_secret_2.key, body.headers["x-credential-identifier"])
+      end)
     end)
 
     describe("RS512", function()
@@ -750,6 +829,44 @@ for _, strategy in helpers.each_strategy() do
       end)
     end)
 
+    describe("ES512", function()
+      it("verifies JWT", function()
+        PAYLOAD.iss = rsa_jwt_secret_6.key
+        local jwt = jwt_encoder.encode(PAYLOAD, fixtures.es512_private_key, "ES512")
+        local authorization = "Bearer " .. jwt
+        local res = assert(proxy_client:send {
+          method  = "GET",
+          path    = "/request",
+          headers = {
+            ["Authorization"] = authorization,
+            ["Host"]          = "jwt1.test",
+          }
+        })
+        local body = cjson.decode(assert.res_status(200, res))
+        assert.equal(authorization, body.headers.authorization)
+        assert.equal("jwt_tests_rsa_consumer_11", body.headers["x-consumer-username"])
+        assert.equal(rsa_jwt_secret_6.key, body.headers["x-credential-identifier"])
+        assert.equal(nil, body.headers["x-credential-username"])
+      end)
+      it("identifies Consumer", function()
+        PAYLOAD.iss = rsa_jwt_secret_6.key
+        local jwt = jwt_encoder.encode(PAYLOAD, fixtures.es512_private_key, "ES512")
+        local authorization = "Bearer " .. jwt
+        local res = assert(proxy_client:send {
+          method  = "GET",
+          path    = "/request",
+          headers = {
+            ["Authorization"] = authorization,
+            ["Host"]          = "jwt1.test",
+          }
+        })
+        local body = cjson.decode(assert.res_status(200, res))
+        assert.equal(authorization, body.headers.authorization)
+        assert.equal("jwt_tests_rsa_consumer_11", body.headers["x-consumer-username"])
+        assert.equal(rsa_jwt_secret_6.key, body.headers["x-credential-identifier"])
+        assert.equal(nil, body.headers["x-credential-username"])
+      end)
+    end)
 
     describe("ES384", function()
       it("verifies JWT", function()
@@ -785,6 +902,177 @@ for _, strategy in helpers.each_strategy() do
         assert.equal(authorization, body.headers.authorization)
         assert.equal("jwt_tests_rsa_consumer_10", body.headers["x-consumer-username"])
         assert.equal(rsa_jwt_secret_5.key, body.headers["x-credential-identifier"])
+      end)
+    end)
+
+    describe("PS256", function()
+      it("verifies JWT", function()
+        PAYLOAD.iss = rsa_jwt_secret_7.key
+        local jwt = jwt_encoder.encode(PAYLOAD, fixtures.ps256_private_key, "PS256")
+        local authorization = "Bearer " .. jwt
+        local res = assert(proxy_client:send {
+          method  = "GET",
+          path    = "/request",
+          headers = {
+            ["Authorization"] = authorization,
+            ["Host"]          = "jwt1.test",
+          }
+        })
+        local body = cjson.decode(assert.res_status(200, res))
+        assert.equal(authorization, body.headers.authorization)
+        assert.equal("jwt_tests_rsa_consumer_12", body.headers["x-consumer-username"])
+        assert.equal(rsa_jwt_secret_7.key, body.headers["x-credential-identifier"])
+        assert.equal(nil, body.headers["x-credential-username"])
+      end)
+      it("identifies Consumer", function()
+        PAYLOAD.iss = rsa_jwt_secret_7.key
+        local jwt = jwt_encoder.encode(PAYLOAD, fixtures.ps256_private_key, "PS256")
+        local authorization = "Bearer " .. jwt
+        local res = assert(proxy_client:send {
+          method  = "GET",
+          path    = "/request",
+          headers = {
+            ["Authorization"] = authorization,
+            ["Host"]          = "jwt1.test",
+          }
+        })
+        local body = cjson.decode(assert.res_status(200, res))
+        assert.equal(authorization, body.headers.authorization)
+        assert.equal("jwt_tests_rsa_consumer_12", body.headers["x-consumer-username"])
+        assert.equal(rsa_jwt_secret_7.key, body.headers["x-credential-identifier"])
+        assert.equal(nil, body.headers["x-credential-username"])
+      end)
+    end)
+
+    describe("PS384", function()
+      it("verifies JWT", function()
+        PAYLOAD.iss = rsa_jwt_secret_8.key
+        local jwt = jwt_encoder.encode(PAYLOAD, fixtures.ps384_private_key, "PS384")
+        local authorization = "Bearer " .. jwt
+        local res = assert(proxy_client:send {
+          method  = "GET",
+          path    = "/request",
+          headers = {
+            ["Authorization"] = authorization,
+            ["Host"]          = "jwt1.test",
+          }
+        })
+        local body = cjson.decode(assert.res_status(200, res))
+        assert.equal(authorization, body.headers.authorization)
+        assert.equal("jwt_tests_rsa_consumer_13", body.headers["x-consumer-username"])
+        assert.equal(rsa_jwt_secret_8.key, body.headers["x-credential-identifier"])
+        assert.equal(nil, body.headers["x-credential-username"])
+      end)
+      it("identifies Consumer", function()
+        PAYLOAD.iss = rsa_jwt_secret_8.key
+        local jwt = jwt_encoder.encode(PAYLOAD, fixtures.ps384_private_key, "PS384")
+        local authorization = "Bearer " .. jwt
+        local res = assert(proxy_client:send {
+          method  = "GET",
+          path    = "/request",
+          headers = {
+            ["Authorization"] = authorization,
+            ["Host"]          = "jwt1.test",
+          }
+        })
+        local body = cjson.decode(assert.res_status(200, res))
+        assert.equal(authorization, body.headers.authorization)
+        assert.equal("jwt_tests_rsa_consumer_13", body.headers["x-consumer-username"])
+        assert.equal(rsa_jwt_secret_8.key, body.headers["x-credential-identifier"])
+        assert.equal(nil, body.headers["x-credential-username"])
+      end)
+    end)
+
+    describe("PS512", function()
+      it("verifies JWT", function()
+        PAYLOAD.iss = rsa_jwt_secret_9.key
+        local jwt = jwt_encoder.encode(PAYLOAD, fixtures.ps512_private_key, "PS512")
+        local authorization = "Bearer " .. jwt
+        local res = assert(proxy_client:send {
+          method  = "GET",
+          path    = "/request",
+          headers = {
+            ["Authorization"] = authorization,
+            ["Host"]          = "jwt1.test",
+          }
+        })
+        local body = cjson.decode(assert.res_status(200, res))
+        assert.equal(authorization, body.headers.authorization)
+        assert.equal("jwt_tests_rsa_consumer_14", body.headers["x-consumer-username"])
+        assert.equal(rsa_jwt_secret_9.key, body.headers["x-credential-identifier"])
+        assert.equal(nil, body.headers["x-credential-username"])
+      end)
+      it("identifies Consumer", function()
+        PAYLOAD.iss = rsa_jwt_secret_9.key
+        local jwt = jwt_encoder.encode(PAYLOAD, fixtures.ps512_private_key, "PS512")
+        local authorization = "Bearer " .. jwt
+        local res = assert(proxy_client:send {
+          method  = "GET",
+          path    = "/request",
+          headers = {
+            ["Authorization"] = authorization,
+            ["Host"]          = "jwt1.test",
+          }
+        })
+        local body = cjson.decode(assert.res_status(200, res))
+        assert.equal(authorization, body.headers.authorization)
+        assert.equal("jwt_tests_rsa_consumer_14", body.headers["x-consumer-username"])
+        assert.equal(rsa_jwt_secret_9.key, body.headers["x-credential-identifier"])
+        assert.equal(nil, body.headers["x-credential-username"])
+      end)
+    end)
+
+    describe("EdDSA", function()
+      it("verifies JWT with Ed25519 key", function()
+        PAYLOAD.iss = rsa_jwt_secret_10.key
+        local jwt = jwt_encoder.encode(PAYLOAD, fixtures.ed25519_private_key, "EdDSA")
+        local authorization = "Bearer " .. jwt
+        local res = assert(proxy_client:send {
+          method  = "GET",
+          path    = "/request",
+          headers = {
+            ["Authorization"] = authorization,
+            ["Host"]          = "jwt1.test",
+          }
+        })
+        local body = cjson.decode(assert.res_status(200, res))
+        assert.equal(authorization, body.headers.authorization)
+        assert.equal(rsa_jwt_secret_10.key, body.headers["x-credential-identifier"])
+        assert.equal(nil, body.headers["x-credential-username"])
+      end)
+      it("verifies JWT with Ed448 key", function()
+        PAYLOAD.iss = rsa_jwt_secret_11.key
+        local jwt = jwt_encoder.encode(PAYLOAD, fixtures.ed448_private_key, "EdDSA")
+        local authorization = "Bearer " .. jwt
+        local res = assert(proxy_client:send {
+          method  = "GET",
+          path    = "/request",
+          headers = {
+            ["Authorization"] = authorization,
+            ["Host"]          = "jwt1.test",
+          }
+        })
+        local body = cjson.decode(assert.res_status(200, res))
+        assert.equal(authorization, body.headers.authorization)
+        assert.equal(rsa_jwt_secret_11.key, body.headers["x-credential-identifier"])
+        assert.equal(nil, body.headers["x-credential-username"])
+      end)
+      it("identifies Consumer", function()
+        PAYLOAD.iss = rsa_jwt_secret_10.key
+        local jwt = jwt_encoder.encode(PAYLOAD, fixtures.ed25519_private_key, "EdDSA")
+        local authorization = "Bearer " .. jwt
+        local res = assert(proxy_client:send {
+          method  = "GET",
+          path    = "/request",
+          headers = {
+            ["Authorization"] = authorization,
+            ["Host"]          = "jwt1.test",
+          }
+        })
+        local body = cjson.decode(assert.res_status(200, res))
+        assert.equal(authorization, body.headers.authorization)
+        assert.equal("jwt_tests_rsa_consumer_15", body.headers["x-consumer-username"])
+        assert.equal(nil, body.headers["x-credential-username"])
       end)
     end)
 
@@ -845,6 +1133,7 @@ for _, strategy in helpers.each_strategy() do
         })
         local body = cjson.decode(assert.res_status(401, res))
         assert.same({ nbf="must be a number", exp="must be a number" }, body)
+        assert.equal('Bearer error="invalid_token"', res.headers["WWW-Authenticate"])
       end)
       it("checks if the fields are valid: `exp` claim", function()
         local payload = {
@@ -862,6 +1151,7 @@ for _, strategy in helpers.each_strategy() do
         })
         local body = assert.res_status(401, res)
         assert.equal('{"exp":"token expired"}', body)
+        assert.equal('Bearer error="invalid_token"', res.headers["WWW-Authenticate"])
       end)
       it("checks if the fields are valid: `nbf` claim", function()
         local payload = {
@@ -879,6 +1169,7 @@ for _, strategy in helpers.each_strategy() do
         })
         local body = assert.res_status(401, res)
         assert.equal('{"nbf":"token not valid yet"}', body)
+        assert.equal('Bearer error="invalid_token"', res.headers["WWW-Authenticate"])
       end)
     end)
 
@@ -953,7 +1244,8 @@ for _, strategy in helpers.each_strategy() do
             ["Host"] = "jwt7.test"
           }
         })
-        assert.response(res).has.status(500)
+        local body = cjson.decode(assert.res_status(500, res))
+        assert.same("anonymous consumer " .. nonexisting_anonymous .. " is configured but doesn't exist", body.message)
       end)
     end)
   end)
@@ -1093,6 +1385,7 @@ for _, strategy in helpers.each_strategy() do
           }
         })
         assert.response(res).has.status(401)
+        assert.equal('Bearer', res.headers["WWW-Authenticate"])
       end)
 
       it("fails 401, with only the second credential provided", function()
@@ -1105,6 +1398,7 @@ for _, strategy in helpers.each_strategy() do
           }
         })
         assert.response(res).has.status(401)
+        assert.equal('Key', res.headers["WWW-Authenticate"])
       end)
 
       it("fails 401, with no credential provided", function()
@@ -1116,6 +1410,7 @@ for _, strategy in helpers.each_strategy() do
           }
         })
         assert.response(res).has.status(401)
+        assert.equal('Bearer', res.headers["WWW-Authenticate"])
       end)
 
     end)

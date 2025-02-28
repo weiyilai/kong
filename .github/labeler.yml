@@ -1,3 +1,7 @@
+'cherry-pick kong-ee':
+- changed-files:
+  - any-glob-to-any-file: ['kong/**/*', 'spec/**/*', 'build/**/*', 'bin/**/*', 'scripts/**/*', 'changelog/**/*']
+
 core/admin-api:
 - changed-files:
   - any-glob-to-any-file: kong/api/**/*
@@ -72,7 +76,7 @@ core/templates:
 
 core/tracing:
 - changed-files:
-  - any-glob-to-any-file: ['kong/tracing/**/*', 'kong/pdk/tracing.lua']
+  - any-glob-to-any-file: ['kong/observability/tracing/**/*', 'kong/pdk/tracing.lua']
 
 core/wasm:
 - changed-files:
@@ -250,9 +254,20 @@ plugins/opentelemetry:
 - changed-files:
   - any-glob-to-any-file: kong/plugins/opentelemetry/**/*
 
+plugins/standard-webhooks:
+- changed-files:
+  - any-glob-to-any-file: kong/plugins/standard-webhooks/**/*
+
+plugins/redirect:
+- changed-files:
+  - any-glob-to-any-file: kong/plugins/redirect/**/*
+
 schema-change-noteworthy:
 - changed-files:
-  - any-glob-to-any-file: ['kong/db/schema/**/*.lua', 'kong/**/schema.lua', 'kong/plugins/**/daos.lua', 'plugins-ee/**/daos.lua', 'plugins-ee/**/schema.lua', 'kong/db/dao/*.lua', 'kong/enterprise_edition/redis/init.lua']
+  - any-glob-to-any-file: [
+      'kong/db/schema/**/*.lua', 'kong/**/schema.lua', 'kong/plugins/**/daos.lua', 'plugins-ee/**/daos.lua', 'plugins-ee/**/schema.lua', 'kong/db/dao/*.lua', 'kong/enterprise_edition/redis/init.lua',
+      'kong/llm/init.lua', 'kong/llm/schemas/*.lua',
+    ]
 
 build/bazel:
 - changed-files:

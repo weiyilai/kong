@@ -308,6 +308,33 @@ describe("NGINX conf compiler", function()
       assert.not_matches("ssl_certificate_by_lua_block", kong_nginx_conf)
       assert.not_matches("ssl_dhparam", kong_nginx_conf)
     end)
+
+    it("renders RPC server", function()
+      local conf = assert(conf_loader(helpers.test_conf_path, {
+        role = "control_plane",
+        cluster_cert = "spec/fixtures/kong_clustering.crt",
+        cluster_cert_key = "spec/fixtures/kong_clustering.key",
+        cluster_listen = "127.0.0.1:9005",
+        cluster_rpc = "on",
+        nginx_conf = "spec/fixtures/custom_nginx.template",
+      }))
+      local kong_nginx_conf = prefix_handler.compile_kong_conf(conf)
+      assert.matches("location = /v2/outlet {", kong_nginx_conf)
+    end)
+
+    it("does not renders RPC server when inert", function()
+      local conf = assert(conf_loader(helpers.test_conf_path, {
+        role = "control_plane",
+        cluster_cert = "spec/fixtures/kong_clustering.crt",
+        cluster_cert_key = "spec/fixtures/kong_clustering.key",
+        cluster_listen = "127.0.0.1:9005",
+        cluster_rpc = "off",
+        nginx_conf = "spec/fixtures/custom_nginx.template",
+      }))
+      local kong_nginx_conf = prefix_handler.compile_kong_conf(conf)
+      assert.not_matches("location = /v2/outlet {", kong_nginx_conf)
+    end)
+
     describe("handles client_ssl", function()
       it("on", function()
         local conf = assert(conf_loader(helpers.test_conf_path, {
@@ -764,7 +791,7 @@ describe("NGINX conf compiler", function()
           nginx_supstream_keepalive = "120",
         }))
         local nginx_conf = prefix_handler.compile_kong_stream_conf(conf)
-        assert.matches("keepalive%s120;", nginx_conf)
+        assert.matches("[^_]keepalive%s120;", nginx_conf)
       end)
 
       it("does not inject directives if value is 'NONE'", function()
@@ -772,7 +799,7 @@ describe("NGINX conf compiler", function()
           nginx_upstream_keepalive = "NONE",
         }))
         local nginx_conf = prefix_handler.compile_kong_conf(conf)
-        assert.not_matches("keepalive%s+%d+;", nginx_conf)
+        assert.not_matches("[^_]keepalive%s+%d+;", nginx_conf)
       end)
 
       describe("default injected NGINX directives", function()
@@ -911,10 +938,18 @@ describe("NGINX conf compiler", function()
       it("injects a shm_kv", function()
         assert.matches("wasm {.+shm_kv counters 10m;.+}", ngx_cfg({ wasm = true, nginx_wasm_shm_kv_counters="10m" }, debug))
       end)
+      it("injects a general shm_kv", function()
+        assert.matches("wasm {.+shm_kv %* 10m;.+}", ngx_cfg({ wasm = true, nginx_wasm_shm_kv = "10m" }, debug))
+      end)
       it("injects multiple shm_kvs", function()
         assert.matches(
-          "wasm {.+shm_kv cache 10m.+shm_kv counters 10m;.+}",
-          ngx_cfg({ wasm = true, nginx_wasm_shm_kv_cache="10m", nginx_wasm_shm_kv_counters="10m"}, debug)
+          "wasm {.+shm_kv cache 10m.+shm_kv counters 10m;.+shm_kv %* 5m;.+}",
+          ngx_cfg({
+            wasm = true,
+            nginx_wasm_shm_kv_cache = "10m",
+            nginx_wasm_shm_kv_counters = "10m",
+            nginx_wasm_shm_kv = "5m",
+          }, debug)
         )
       end)
       it("injects default configurations if wasm=on", function()
@@ -925,15 +960,14 @@ describe("NGINX conf compiler", function()
       end)
       it("does not inject default configurations if wasm=off", function()
         assert.not_matches(
-          ".+proxy_wasm_lua_resolver on;.+",
+          ".+proxy_wasm_lua_resolver.+",
           kong_ngx_cfg({ wasm = false, }, debug)
         )
       end)
-      it("permits overriding proxy_wasm_lua_resolver", function()
+      it("permits overriding proxy_wasm_lua_resolver to off", function()
         assert.matches(
           ".+proxy_wasm_lua_resolver off;.+",
           kong_ngx_cfg({ wasm = true,
-                         -- or should this be `false`? IDK
                          nginx_http_proxy_wasm_lua_resolver = "off",
                        }, debug)
         )
@@ -965,6 +999,14 @@ describe("NGINX conf compiler", function()
             wasm = true,
             nginx_wasm_wasmer_flag1=true,
             nginx_wasm_wasmer_flag2="1m",
+          }, debug)
+        )
+      end)
+      it("injects wasmtime cache_config", function()
+        assert.matches(
+          "wasm {.+wasmtime {.+cache_config .+%.wasmtime_config%.toml.*;",
+          ngx_cfg({
+            wasm = true,
           }, debug)
         )
       end)
@@ -1569,6 +1611,121 @@ describe("NGINX conf compiler", function()
     it("include nginx-kong-stream-inject.conf in nginx-kong-stream.conf", function()
       local nginx_conf = prefix_handler.compile_kong_stream_conf(helpers.test_conf)
       assert.matches("include 'nginx-kong-stream-inject.conf';", nginx_conf, nil, true)
+    end)
+  end)
+
+  describe("compile_kong_gui_include_conf()", function()
+    describe("Content-Security-Policy", function()
+      it("should not add header by default", function()
+        local conf = assert(conf_loader(helpers.test_conf_path))
+        local gui_include_conf = prefix_handler.compile_kong_gui_include_conf(conf)
+
+        assert.not_matches("add_header Content-Security-Policy", gui_include_conf, nil, true)
+      end)
+
+      it("should add header with default admin_listen", function()
+        local conf = assert(conf_loader(helpers.test_conf_path, {
+          admin_gui_csp_header = "on",
+        }))
+        local gui_include_conf = assert(prefix_handler.compile_kong_gui_include_conf(conf))
+        local found_connect_src = false
+
+        for line in gui_include_conf:gmatch("(.-)\n") do
+          if line:find("add_header Content-Security-Policy", 1, true) then
+            assert.matches("connect-src 'self' https://api.github.com/repos/kong/kong http://$host:9001;", line, nil,
+              true)
+            found_connect_src = true
+            break
+          end
+        end
+
+        assert.True(found_connect_src)
+      end)
+
+      it("should add header with one more secure admin_listen", function()
+        local conf = assert(conf_loader(helpers.test_conf_path, {
+          admin_gui_csp_header = "on",
+          admin_listen = "127.0.0.1:9001, 127.0.0.1:9444 ssl",
+        }))
+        local gui_include_conf = assert(prefix_handler.compile_kong_gui_include_conf(conf))
+        local found_connect_src = false
+
+        for line in gui_include_conf:gmatch("(.-)\n") do
+          if line:find("add_header Content-Security-Policy", 1, true) then
+            assert.matches(
+            "connect-src 'self' https://api.github.com/repos/kong/kong http://$host:9001 https://$host:9444;", line, nil,
+              true)
+            found_connect_src = true
+            break
+          end
+        end
+
+        assert.True(found_connect_src)
+      end)
+
+      it("should add header with only secure admin_listen", function()
+        local conf = assert(conf_loader(helpers.test_conf_path, {
+          admin_gui_csp_header = "on",
+          admin_listen = "127.0.0.1:9444 ssl"
+        }))
+        local gui_include_conf = assert(prefix_handler.compile_kong_gui_include_conf(conf))
+        local found_connect_src = false
+
+        for line in gui_include_conf:gmatch("(.-)\n") do
+          if line:find("add_header Content-Security-Policy", 1, true) then
+            assert.matches(
+            "connect-src 'self' https://api.github.com/repos/kong/kong https://$host:9444;", line, nil,
+              true)
+            found_connect_src = true
+            break
+          end
+        end
+
+        assert.True(found_connect_src)
+      end)
+
+      it("should add header without admin_listen", function()
+        -- Although kong_gui is not served when admin_listeners is off, we are test against the
+        -- compile function itself.
+        local conf = assert(conf_loader(helpers.test_conf_path, {
+          admin_gui_csp_header = "on",
+          admin_listen = "off"
+        }))
+        local gui_include_conf = assert(prefix_handler.compile_kong_gui_include_conf(conf))
+        local found_connect_src = false
+
+        for line in gui_include_conf:gmatch("(.-)\n") do
+          if line:find("add_header Content-Security-Policy", 1, true) then
+            assert.matches(
+            "connect-src 'self' https://api.github.com/repos/kong/kong;", line, nil, true)
+            found_connect_src = true
+            break
+          end
+        end
+
+        assert.True(found_connect_src)
+      end)
+
+      it("should add header with custom admin_gui_api_url", function()
+        local conf = assert(conf_loader(helpers.test_conf_path, {
+          admin_gui_csp_header = "on",
+          admin_gui_api_url = "http://admin-api.kong.local:18001"
+        }))
+        local gui_include_conf = assert(prefix_handler.compile_kong_gui_include_conf(conf))
+        local found_connect_src = false
+
+        for line in gui_include_conf:gmatch("(.-)\n") do
+          if line:find("add_header Content-Security-Policy", 1, true) then
+            assert.matches(
+            "connect-src 'self' https://api.github.com/repos/kong/kong http://admin-api.kong.local:18001;", line, nil,
+              true)
+            found_connect_src = true
+            break
+          end
+        end
+
+        assert.True(found_connect_src)
+      end)
     end)
   end)
 end)

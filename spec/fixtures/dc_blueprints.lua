@@ -1,6 +1,6 @@
 local blueprints = require "spec.fixtures.blueprints"
-local utils = require "kong.tools.utils"
 local assert = require "luassert"
+local cycle_aware_deep_copy = require("kong.tools.table").cycle_aware_deep_copy
 
 
 local dc_blueprints = {}
@@ -28,7 +28,9 @@ local function remove_nulls(tbl)
 end
 
 
-local function wrap_db(db)
+-- tparam boolean expand_foreigns expand the complete "foreign"-type fields, not
+-- replacing it with "string"-type fields
+local function wrap_db(db, expand_foreigns)
   local dc_as_db = {}
 
   local config = new_config()
@@ -36,27 +38,27 @@ local function wrap_db(db)
   for name, _ in pairs(db.daos) do
     dc_as_db[name] = {
       insert = function(_, tbl)
-        tbl = utils.cycle_aware_deep_copy(tbl)
+        tbl = cycle_aware_deep_copy(tbl)
         if not config[name] then
           config[name] = {}
         end
         local schema = db.daos[name].schema
         tbl = schema:process_auto_fields(tbl, "insert")
         for fname, field in schema:each_field() do
-          if field.type == "foreign" then
+          if not expand_foreigns and field.type == "foreign" then
             tbl[fname] = type(tbl[fname]) == "table"
                          and tbl[fname].id
                          or nil
           end
         end
         table.insert(config[name], remove_nulls(tbl))
-        return utils.cycle_aware_deep_copy(tbl)
+        return cycle_aware_deep_copy(tbl)
       end,
       update = function(_, id, tbl)
         if not config[name] then
           return nil, "not found"
         end
-        tbl = utils.cycle_aware_deep_copy(tbl)
+        tbl = cycle_aware_deep_copy(tbl)
         local element
         for _, e in ipairs(config[name]) do
           if e.id == id then
@@ -95,11 +97,11 @@ local function wrap_db(db)
   end
 
   dc_as_db.export = function()
-    return utils.cycle_aware_deep_copy(config)
+    return cycle_aware_deep_copy(config)
   end
 
   dc_as_db.import = function(input)
-    config = utils.cycle_aware_deep_copy(input)
+    config = cycle_aware_deep_copy(input)
   end
 
   dc_as_db.reset = function()
@@ -110,8 +112,8 @@ local function wrap_db(db)
 end
 
 
-function dc_blueprints.new(db)
-  local dc_as_db = wrap_db(db)
+function dc_blueprints.new(db, expand_foreigns)
+  local dc_as_db = wrap_db(db, expand_foreigns)
 
   local save_dc = new_config()
 

@@ -6,7 +6,7 @@ local cjson = require "cjson"
 local pkey = require("resty.openssl.pkey")
 local x509 = require("resty.openssl.x509")
 
-local utils = require "kong.tools.utils"
+local cycle_aware_deep_copy = require("kong.tools.table").cycle_aware_deep_copy
 
 local client
 
@@ -110,7 +110,7 @@ for _, strategy in ipairs(strategies) do
     describe("create with preconfigured account_key with key_set", function()
       lazy_setup(function()
         account_key = {key_id = KEY_ID, key_set = KEY_SET_NAME}
-        config = utils.cycle_aware_deep_copy(proper_config)
+        config = cycle_aware_deep_copy(proper_config)
         config.account_key = account_key
         c = client.new(config)
 
@@ -167,7 +167,7 @@ for _, strategy in ipairs(strategies) do
     describe("create with preconfigured account_key without key_set", function()
       lazy_setup(function()
         account_key = {key_id = KEY_ID}
-        config = utils.cycle_aware_deep_copy(proper_config)
+        config = cycle_aware_deep_copy(proper_config)
         config.account_key = account_key
         c = client.new(config)
 
@@ -208,7 +208,7 @@ for _, strategy in ipairs(strategies) do
       local account_keys = {}
 
       lazy_setup(function()
-        config = utils.cycle_aware_deep_copy(proper_config)
+        config = cycle_aware_deep_copy(proper_config)
         c = client.new(config)
 
         account_keys[1] = util.create_pkey()
@@ -451,6 +451,18 @@ for _, strategy in ipairs({"off"}) do
         local renew, err = client._check_expire(certkey.cert, 30 * 86400)
         assert.is_nil(err)
         assert.is_falsy(renew)
+      end)
+
+      it("calling handler.renew with a false argument should be successful", function()
+        local handler = require("kong.plugins.acme.handler")
+        handler:configure({{domains = {"example.com"}}})
+
+        local original = client.renew_certificate
+        client.renew_certificate = function (config)
+          print("mock renew_certificate")
+        end
+        handler.renew(false)
+        client.renew_certificate = original
       end)
     end)
 

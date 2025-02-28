@@ -41,6 +41,9 @@ cluster_ocsp = off
 cluster_max_payload = 16777216
 cluster_use_proxy = off
 cluster_dp_labels = NONE
+cluster_rpc = off
+cluster_rpc_sync = off
+cluster_cjson = off
 
 lmdb_environment_path = dbless.lmdb
 lmdb_map_size = 2048m
@@ -94,6 +97,7 @@ nginx_http_ssl_session_timeout = NONE
 nginx_http_ssl_conf_command = NONE
 nginx_http_proxy_ssl_conf_command = NONE
 nginx_http_lua_ssl_conf_command = NONE
+nginx_http_grpc_ssl_conf_command = NONE
 nginx_http_lua_regex_match_limit = 100000
 nginx_http_lua_regex_cache_max_entries = 8192
 nginx_http_keepalive_requests = 10000
@@ -167,6 +171,17 @@ dns_not_found_ttl = 30
 dns_error_ttl = 1
 dns_no_sync = off
 
+new_dns_client = off
+
+resolver_address = NONE
+resolver_hosts_file = /etc/hosts
+resolver_family = A,SRV
+resolver_valid_ttl = NONE
+resolver_stale_ttl = 3600
+resolver_lru_cache_size = 10000
+resolver_mem_cache_size = 5m
+resolver_error_ttl = 1
+
 dedicated_config_processing = on
 worker_consistency = eventual
 worker_state_update_frequency = 5
@@ -196,6 +211,7 @@ untrusted_lua_sandbox_environment =
 admin_gui_url =
 admin_gui_path = /
 admin_gui_api_url = NONE
+admin_gui_csp_header = off
 
 openresty_path =
 
@@ -207,6 +223,7 @@ tracing_sampling_rate = 0.01
 wasm = off
 wasm_filters_path = NONE
 wasm_dynamic_module = NONE
+wasm_filters = bundled,user
 
 request_debug = on
 request_debug_token =

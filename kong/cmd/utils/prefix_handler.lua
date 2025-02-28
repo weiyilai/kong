@@ -5,6 +5,7 @@ local kong_nginx_stream_template = require "kong.templates.nginx_kong_stream"
 local nginx_main_inject_template = require "kong.templates.nginx_inject"
 local nginx_http_inject_template = require "kong.templates.nginx_kong_inject"
 local nginx_stream_inject_template = require "kong.templates.nginx_kong_stream_inject"
+local wasmtime_cache_template = require "kong.templates.wasmtime_cache_config"
 local system_constants = require "lua_system_constants"
 local process_secrets = require "kong.cmd.utils.process_secrets"
 local openssl_bignum = require "resty.openssl.bn"
@@ -14,7 +15,6 @@ local x509 = require "resty.openssl.x509"
 local x509_extension = require "resty.openssl.x509.extension"
 local x509_name = require "resty.openssl.x509.name"
 local pl_template = require "pl.template"
-local pl_stringx = require "pl.stringx"
 local pl_tablex = require "pl.tablex"
 local pl_utils = require "pl.utils"
 local pl_file = require "pl.file"
@@ -24,6 +24,12 @@ local log = require "kong.cmd.utils.log"
 local ffi = require "ffi"
 local bit = require "bit"
 local nginx_signals = require "kong.cmd.utils.nginx_signals"
+local admin_gui_utils = require "kong.admin_gui.utils"
+
+
+local strip = require("kong.tools.string").strip
+local split = require("kong.tools.string").split
+local shallow_copy = require("kong.tools.table").shallow_copy
 
 
 local getmetatable = getmetatable
@@ -41,6 +47,7 @@ local math = math
 local join = pl_path.join
 local io = io
 local os = os
+local fmt = string.format
 
 
 local function pre_create_private_file(file)
@@ -227,12 +234,16 @@ local function get_ulimit()
   if not ok then
     return nil, stderr
   end
-  local sanitized_limit = pl_stringx.strip(stdout)
+  local sanitized_limit = strip(stdout)
   if sanitized_limit:lower():match("unlimited") then
     return 65536
   else
     return tonumber(sanitized_limit)
   end
+end
+
+local function quote(s)
+  return fmt("%q", s)
 end
 
 local function compile_conf(kong_config, conf_template, template_env_inject)
@@ -244,7 +255,8 @@ local function compile_conf(kong_config, conf_template, template_env_inject)
     tostring = tostring,
     os = {
       getenv = os.getenv,
-    }
+    },
+    quote = quote,
   }
 
   local kong_proxy_access_log = kong_config.proxy_access_log
@@ -363,40 +375,62 @@ local function write_env_file(path, data)
   return true
 end
 
-local function write_process_secrets_file(path, data)
-  os.remove(path)
+local function write_process_secrets_file(kong_conf, data)
+  local path = kong_conf.kong_process_secrets
 
-  local flags = bit.bor(system_constants.O_RDONLY(),
-                        system_constants.O_CREAT())
+  local function write_single_secret_file(path, data)
+    os.remove(path)
 
-  local mode = ffi.new("int", bit.bor(system_constants.S_IRUSR(),
-                                      system_constants.S_IWUSR()))
+    local flags = bit.bor(system_constants.O_RDONLY(),
+                          system_constants.O_CREAT())
 
-  local fd = ffi.C.open(path, flags, mode)
-  if fd < 0 then
-    local errno = ffi.errno()
-    return nil, "unable to open process secrets path " .. path .. " (" ..
-                ffi.string(ffi.C.strerror(errno)) .. ")"
+    local mode = ffi.new("int", bit.bor(system_constants.S_IRUSR(),
+                                        system_constants.S_IWUSR()))
+
+    local fd = ffi.C.open(path, flags, mode)
+    if fd < 0 then
+      local errno = ffi.errno()
+      return nil, "unable to open process secrets path " .. path .. " (" ..
+                  ffi.string(ffi.C.strerror(errno)) .. ")"
+    end
+
+    local ok = ffi.C.close(fd)
+    if ok ~= 0 then
+      local errno = ffi.errno()
+      return nil, "failed to close fd (" ..
+                  ffi.string(ffi.C.strerror(errno)) .. ")"
+    end
+
+    local file, err = io.open(path, "w+b")
+    if not file then
+      return nil, "unable to open process secrets path " .. path .. " (" .. err .. ")"
+    end
+
+    local ok, err = file:write(data)
+
+    file:close()
+
+    if not ok then
+      return nil, "unable to write process secrets path " .. path .. " (" .. err .. ")"
+    end
+
+    return true
+
   end
 
-  local ok = ffi.C.close(fd)
-  if ok ~= 0 then
-    local errno = ffi.errno()
-    return nil, "failed to close fd (" ..
-                ffi.string(ffi.C.strerror(errno)) .. ")"
+  if kong_conf.role == "control_plane" or #kong_conf.proxy_listeners > 0
+    or #kong_conf.admin_listeners > 0 or #kong_conf.status_listeners > 0 then
+    local ok, err = write_single_secret_file(path .. "_http", data)
+    if not ok then
+      return nil, err
+    end
   end
 
-  local file, err = io.open(path, "w+b")
-  if not file then
-    return nil, "unable to open process secrets path " .. path .. " (" .. err .. ")"
-  end
-
-  local ok, err = file:write(data)
-
-  file:close()
-
-  if not ok then
-    return nil, "unable to write process secrets path " .. path .. " (" .. err .. ")"
+  if #kong_conf.stream_listeners > 0 then
+    local ok, err = write_single_secret_file(path .. "_stream", data)
+    if not ok then
+      return nil, err
+    end
   end
 
   return true
@@ -407,7 +441,35 @@ local function compile_kong_conf(kong_config, template_env_inject)
 end
 
 local function compile_kong_gui_include_conf(kong_config)
-  return compile_conf(kong_config, kong_nginx_gui_include_template)
+  -- Build connect-src in the CSP header
+  -- Other parts are defined inside nginx_kong_gui_include.lua
+  local csp_connect_src
+  if kong_config.admin_gui_csp_header then
+    -- TODO: Try bundling buttons.js with frontend assets instead of loading it from a URL
+    csp_connect_src = { "'self'", "https://api.github.com/repos/kong/kong" }
+    if kong_config.admin_gui_api_url then
+      table.insert(csp_connect_src, kong_config.admin_gui_api_url)
+    else
+      -- If admin_gui_api_url is missing, we will add dynamic sources that echoes the requested host
+      -- with ports defined in admin_listeners corresponding to the scheme
+      local api_listen = admin_gui_utils.select_listener(kong_config.admin_listeners, { ssl = false })
+      local api_port = api_listen and api_listen.port
+      if api_port then
+        table.insert(csp_connect_src, "http://$host:" .. api_port)
+      end
+
+      local api_ssl_listen = admin_gui_utils.select_listener(kong_config.admin_listeners, { ssl = true })
+      local api_ssl_port = api_ssl_listen and api_ssl_listen.port
+      if api_ssl_port then
+        table.insert(csp_connect_src, "https://$host:" .. api_ssl_port)
+      end
+    end
+    csp_connect_src = table.concat(csp_connect_src, " ")
+  end
+
+  return compile_conf(kong_config, kong_nginx_gui_include_template, {
+    admin_gui_csp_connect_src = csp_connect_src,
+  })
 end
 
 local function compile_kong_stream_conf(kong_config, template_env_inject)
@@ -417,6 +479,10 @@ end
 local function compile_nginx_conf(kong_config, template)
   template = template or default_nginx_template
   return compile_conf(kong_config, template)
+end
+
+local function compile_wasmtime_cache_conf(kong_config)
+  return compile_conf(kong_config, wasmtime_cache_template)
 end
 
 local function prepare_prefixed_interface_dir(usr_path, interface_dir, kong_config)
@@ -465,6 +531,19 @@ local function prepare_prefix(kong_config, nginx_custom_template_path, skip_writ
     end
   elseif not pl_path.isdir(kong_config.prefix) then
     return nil, kong_config.prefix .. " is not a directory"
+  end
+
+  if not exists(kong_config.socket_path) then
+    local ok, err = makepath(kong_config.socket_path)
+    if not ok then
+      return nil, err
+    end
+
+    local ok, _, _, stderr = pl_utils.executeex("chmod 755 " .. kong_config.socket_path)
+    if not ok then
+      return nil, "can not set correct permissions for socket path: " .. kong_config.socket_path
+                  .. " (" .. stderr .. ")"
+    end
   end
 
   -- create directories in prefix
@@ -673,6 +752,23 @@ local function prepare_prefix(kong_config, nginx_custom_template_path, skip_writ
     return true
   end
 
+  if kong_config.wasm then
+    if kong_config.wasmtime_cache_directory then
+      local ok, err = makepath(kong_config.wasmtime_cache_directory)
+      if not ok then
+        return nil, err
+      end
+    end
+
+    if kong_config.wasmtime_cache_config_file  then
+      local wasmtime_conf, err = compile_wasmtime_cache_conf(kong_config)
+      if not wasmtime_conf then
+        return nil, err
+      end
+      pl_file.write(kong_config.wasmtime_cache_config_file, wasmtime_conf)
+    end
+  end
+
   -- compile Nginx configurations
   local nginx_template
   if nginx_custom_template_path then
@@ -697,7 +793,7 @@ local function prepare_prefix(kong_config, nginx_custom_template_path, skip_writ
   end
 
   local template_env = {}
-  nginx_conf_flags = nginx_conf_flags and pl_stringx.split(nginx_conf_flags, ",") or {}
+  nginx_conf_flags = nginx_conf_flags and split(nginx_conf_flags, ",") or {}
   for _, flag in ipairs(nginx_conf_flags) do
     template_env[flag] = true
   end
@@ -791,21 +887,32 @@ local function prepare_prefix(kong_config, nginx_custom_template_path, skip_writ
     "",
   }
 
-  local refs = kong_config["$refs"]
-  local has_refs = refs and type(refs) == "table"
-
-  local secrets
-  if write_process_secrets and has_refs then
-    secrets = process_secrets.extract(kong_config)
-  end
-
   local function quote_hash(s)
     return s:gsub("#", "\\#")
   end
 
+  local refs = kong_config["$refs"]
+  local has_refs = refs and type(refs) == "table"
+  local secrets = process_secrets.extract(kong_config)
+
   for k, v in pairs(kong_config) do
+    -- do not output secrets in .kong_env
     if has_refs and refs[k] then
-      v = refs[k]
+      local ref = refs[k]
+      if type(ref) == "table" then
+        if type(v) ~= "table" then
+          v = { v }
+        else
+          v = shallow_copy(v)
+        end
+
+        for i, r in pairs(ref) do
+          v[i] = r
+        end
+
+      elseif ref then
+        v = ref
+      end
     end
 
     if type(v) == "table" then
@@ -831,13 +938,13 @@ local function prepare_prefix(kong_config, nginx_custom_template_path, skip_writ
     prepare_prefixed_interface_dir("/usr/local/kong", "gui", kong_config)
   end
 
-  if secrets then
+  if secrets and write_process_secrets then
     secrets, err = process_secrets.serialize(secrets, kong_config.kong_env)
     if not secrets then
       return nil, err
     end
 
-    ok, err = write_process_secrets_file(kong_config.kong_process_secrets, secrets)
+    ok, err = write_process_secrets_file(kong_config, secrets)
     if not ok then
       return nil, err
     end

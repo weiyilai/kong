@@ -21,6 +21,8 @@ describe("kong.log.serialize", function()
             },
           },
           KONG_PROXIED = true,
+          KONG_RECEIVE_TIME = 100,
+          KONG_PROXY_LATENCY = 200,
         },
         var = {
           kong_request_id = "1234",
@@ -52,7 +54,7 @@ describe("kong.log.serialize", function()
         get_phase = function() return "access" end,
       }
 
-      package.loaded["kong.tracing.request_id"] = nil
+      package.loaded["kong.observability.tracing.request_id"] = nil
       package.loaded["kong.pdk.log"] = nil
       kong.log = require "kong.pdk.log".new(kong)
 
@@ -73,9 +75,10 @@ describe("kong.log.serialize", function()
 
         -- Latencies
         assert.is_table(res.latencies)
-        assert.equal(0, res.latencies.kong)
+        assert.equal(200, res.latencies.kong)
         assert.equal(-1, res.latencies.proxy)
         assert.equal(2000, res.latencies.request)
+        assert.equal(100, res.latencies.receive)
 
         -- Request
         assert.is_table(res.request)
@@ -228,6 +231,20 @@ describe("kong.log.serialize", function()
         assert.not_equal(tostring(ngx.ctx.service),
                          tostring(res.service))
       end)
+
+      it("handle 'json.null' and 'cdata null'", function()
+        kong.log.set_serialize_value("response.body", ngx.null)
+        local pok, value = pcall(kong.log.serialize, {})
+        assert.is_true(pok)
+        assert.is_true(type(value) == "table")
+
+        local ffi = require "ffi"
+        local n = ffi.new("void*")
+        kong.log.set_serialize_value("response.body", n)
+        local pok, value = pcall(kong.log.serialize, {})
+        assert.is_false(pok)
+        assert.is_true(type(value) == "string")
+      end)
     end)
   end)
 
@@ -236,6 +253,7 @@ describe("kong.log.serialize", function()
       _G.ngx = {
         config = {
           subsystem = "stream",
+          is_console = true,
         },
         ctx = {
           balancer_data = {

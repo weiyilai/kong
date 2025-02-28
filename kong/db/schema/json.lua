@@ -25,7 +25,7 @@ local cjson_encode = cjson.encode
 
 
 -- The correct identifier for draft-4 is 'http://json-schema.org/draft-04/schema#'
--- with the the fragment (#) intact. Newer editions use an identifier _without_
+-- with the fragment (#) intact. Newer editions use an identifier _without_
 -- the fragment (e.g. 'https://json-schema.org/draft/2020-12/schema'), so we
 -- will be lenient when comparing these strings.
 assert(type(metaschema.id) == "string",
@@ -36,7 +36,7 @@ local DRAFT_4 = DRAFT_4_NO_FRAGMENT .. "#"
 _M.DRAFT_4 = DRAFT_4
 
 
----@type table<string, table>
+---@type table<string, kong.db.schema.json.schema_doc>
 local schemas = {}
 
 
@@ -165,7 +165,7 @@ end
 -- Retrieve a schema from local storage by name.
 --
 ---@param name string
----@return table|nil schema
+---@return kong.db.schema.json.schema_doc? schema
 function _M.get_schema(name)
   return schemas[name]
 end
@@ -175,7 +175,6 @@ end
 -- Remove a schema from local storage by name (if it exists).
 --
 ---@param name string
----@return table|nil schema
 function _M.remove_schema(name)
   schemas[name] = nil
 end

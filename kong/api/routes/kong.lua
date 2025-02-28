@@ -200,6 +200,11 @@ return {
       return validate_schema("plugins", self.params)
     end
   },
+  ["/schemas/vaults/validate"] = {
+    POST = function(self, db, helpers)
+      return validate_schema("vaults", self.params)
+    end
+  },
   ["/schemas/:db_entity_name/validate"] = {
     POST = function(self, db, helpers)
       local db_entity_name = self.params.db_entity_name
@@ -264,5 +269,20 @@ return {
       }
       return kong.response.exit(200, body)
     end
-  }
+  },
+  ["/status/dns"] = {
+    GET = function (self, db, helpers)
+      if not kong.configuration.new_dns_client then
+        return kong.response.exit(501, { message = "not implemented with the legacy DNS client" })
+      end
+
+      return kong.response.exit(200, {
+        worker = {
+          id = ngx.worker.id() or -1,
+          count = ngx.worker.count(),
+        },
+        stats = kong.dns.stats(),
+      })
+    end
+  },
 }

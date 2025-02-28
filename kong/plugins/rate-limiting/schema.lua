@@ -1,6 +1,5 @@
 local typedefs = require "kong.db.schema.typedefs"
 local redis_schema = require "kong.tools.redis.schema"
-local deprecation = require "kong.deprecation"
 
 local SYNC_RATE_REALTIME = -1
 
@@ -103,83 +102,92 @@ return {
           -- TODO: deprecated forms, to be removed in Kong 4.0
           { redis_host = {
             type = "string",
-            translate_backwards = {'redis', 'host'},
+            deprecation = {
+              replaced_with = { { path = { 'redis', 'host' } } },
+              message = "rate-limiting: config.redis_host is deprecated, please use config.redis.host instead",
+              removal_in_version = "4.0", },
             func = function(value)
-              deprecation("rate-limiting: config.redis_host is deprecated, please use config.redis.host instead",
-                { after = "4.0", })
               return { redis = { host = value } }
             end
           } },
           { redis_port = {
             type = "integer",
-            translate_backwards = {'redis', 'port'},
+            deprecation = {
+              replaced_with = { { path = { 'redis', 'port' } } },
+              message = "rate-limiting: config.redis_port is deprecated, please use config.redis.port instead",
+              removal_in_version = "4.0", },
             func = function(value)
-              deprecation("rate-limiting: config.redis_port is deprecated, please use config.redis.port instead",
-                { after = "4.0", })
               return { redis = { port = value } }
             end
           } },
           { redis_password = {
             type = "string",
             len_min = 0,
-            translate_backwards = {'redis', 'password'},
+            deprecation = {
+              replaced_with = { { path = { 'redis', 'password' } } },
+              message = "rate-limiting: config.redis_password is deprecated, please use config.redis.password instead",
+              removal_in_version = "4.0", },
             func = function(value)
-              deprecation("rate-limiting: config.redis_password is deprecated, please use config.redis.password instead",
-                { after = "4.0", })
               return { redis = { password = value } }
             end
           } },
           { redis_username = {
             type = "string",
-            translate_backwards = {'redis', 'username'},
+            deprecation = {
+              replaced_with = { { path = { 'redis', 'username' } } },
+              message = "rate-limiting: config.redis_username is deprecated, please use config.redis.username instead",
+              removal_in_version = "4.0", },
             func = function(value)
-              deprecation("rate-limiting: config.redis_username is deprecated, please use config.redis.username instead",
-                { after = "4.0", })
               return { redis = { username = value } }
             end
           } },
           { redis_ssl = {
             type = "boolean",
-            translate_backwards = {'redis', 'ssl'},
+            deprecation = {
+              replaced_with = { { path = { 'redis', 'ssl' } } },
+              message = "rate-limiting: config.redis_ssl is deprecated, please use config.redis.ssl instead",
+              removal_in_version = "4.0", },
             func = function(value)
-              deprecation("rate-limiting: config.redis_ssl is deprecated, please use config.redis.ssl instead",
-                { after = "4.0", })
               return { redis = { ssl = value } }
             end
           } },
           { redis_ssl_verify = {
             type = "boolean",
-            translate_backwards = {'redis', 'ssl_verify'},
+            deprecation = {
+              replaced_with = { { path = { 'redis', 'ssl_verify' } } },
+              message = "rate-limiting: config.redis_ssl_verify is deprecated, please use config.redis.ssl_verify instead",
+              removal_in_version = "4.0", },
             func = function(value)
-              deprecation("rate-limiting: config.redis_ssl_verify is deprecated, please use config.redis.ssl_verify instead",
-                { after = "4.0", })
               return { redis = { ssl_verify = value } }
             end
           } },
           { redis_server_name = {
             type = "string",
-            translate_backwards = {'redis', 'server_name'},
+            deprecation = {
+              replaced_with = { { path = { 'redis', 'server_name' } } },
+              message = "rate-limiting: config.redis_server_name is deprecated, please use config.redis.server_name instead",
+              removal_in_version = "4.0", },
             func = function(value)
-              deprecation("rate-limiting: config.redis_server_name is deprecated, please use config.redis.server_name instead",
-                { after = "4.0", })
               return { redis = { server_name = value } }
             end
           } },
           { redis_timeout = {
             type = "integer",
-            translate_backwards = {'redis', 'timeout'},
+            deprecation = {
+              replaced_with = { { path = { 'redis', 'timeout' } } },
+              message = "rate-limiting: config.redis_timeout is deprecated, please use config.redis.timeout instead",
+              removal_in_version = "4.0", },
             func = function(value)
-              deprecation("rate-limiting: config.redis_timeout is deprecated, please use config.redis.timeout instead",
-                { after = "4.0", })
               return { redis = { timeout = value } }
             end
           } },
           { redis_database = {
             type = "integer",
-            translate_backwards = {'redis', 'database'},
+            deprecation = {
+              replaced_with = { { path = { 'redis', 'database' } } },
+              message = "rate-limiting: config.redis_database is deprecated, please use config.redis.database instead",
+              removal_in_version = "4.0", },
             func = function(value)
-              deprecation("rate-limiting: config.redis_database is deprecated, please use config.redis.database instead",
-                { after = "4.0", })
               return { redis = { database = value } }
             end
           } },

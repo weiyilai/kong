@@ -3,6 +3,7 @@ local DAO = require "kong.db.dao"
 local plugin_loader = require "kong.db.schema.plugin_loader"
 local reports = require "kong.reports"
 local plugin_servers = require "kong.runloop.plugin_servers"
+local wasm_plugins = require "kong.runloop.wasm.plugins"
 local version = require "version"
 local load_module_if_exists = require "kong.tools.module".load_module_if_exists
 
@@ -11,6 +12,7 @@ local Plugins = {}
 
 
 local fmt = string.format
+local type = type
 local null = ngx.null
 local pairs = pairs
 local tostring = tostring
@@ -64,9 +66,8 @@ local function check_protocols_match(self, plugin)
       })
       return nil, tostring(err_t), err_t
     end
-  end
 
-  if type(plugin.service) == "table" then
+  elseif type(plugin.service) == "table" then
     if not has_common_protocol_with_service(self, plugin, plugin.service) then
       local err_t = self.errors:schema_violation({
         protocols = "must match the protocols of at least one route " ..
@@ -89,18 +90,23 @@ end
 
 
 function Plugins:update(primary_key, entity, options)
-  options = options or {}
-  options.hide_shorthands = true
-  local rbw_entity = self.super.select(self, primary_key, options) -- ignore errors
-  if rbw_entity then
-    entity = self.schema:merge_values(entity, rbw_entity)
+  if entity.protocols or entity.service or entity.route then
+    if (entity.protocols and not entity.route)
+    or (entity.service and not entity.protocols)
+    or (entity.route and not entity.protocols)
+    then
+      local rbw_entity = self.super.select(self, primary_key, options)
+      if rbw_entity then
+        entity.protocols = entity.protocols or rbw_entity.protocols
+        entity.service = entity.service or rbw_entity.service
+        entity.route = entity.route or rbw_entity.route
+      end
+    end
+    local ok, err, err_t = check_protocols_match(self, entity)
+    if not ok then
+      return nil, err, err_t
+    end
   end
-  local ok, err, err_t = check_protocols_match(self, entity)
-  if not ok then
-    return nil, err, err_t
-  end
-
-  options.hide_shorthands = false
   return self.super.update(self, primary_key, entity, options)
 end
 
@@ -155,6 +161,13 @@ local load_plugin_handler do
 
     local plugin_handler = "kong.plugins." .. plugin .. ".handler"
     local ok, handler = load_module_if_exists(plugin_handler)
+    if not ok then
+      ok, handler = wasm_plugins.load_plugin(plugin)
+      if type(handler) == "table" then
+        handler._wasm = true
+      end
+    end
+
     if not ok then
       ok, handler = plugin_servers.load_plugin(plugin)
       if type(handler) == "table" then

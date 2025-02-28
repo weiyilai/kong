@@ -1,11 +1,13 @@
 local cjson = require "cjson"
 local iteration = require "kong.db.iteration"
-local utils = require "kong.tools.utils"
+local kong_table = require "kong.tools.table"
 local defaults = require "kong.db.strategies.connector".defaults
 local hooks = require "kong.hooks"
 local workspaces = require "kong.workspaces"
 local new_tab = require "table.new"
 local DAO_MAX_TTL = require("kong.constants").DATABASE.DAO_MAX_TTL
+local is_valid_uuid = require("kong.tools.uuid").is_valid_uuid
+local deep_copy     = require("kong.tools.table").deep_copy
 
 local setmetatable = setmetatable
 local tostring     = tostring
@@ -22,7 +24,7 @@ local log          = ngx.log
 local fmt          = string.format
 local match        = string.match
 local run_hook     = hooks.run_hook
-local table_merge  = utils.table_merge
+local table_merge  = kong_table.table_merge
 
 
 local ERR          = ngx.ERR
@@ -154,7 +156,7 @@ local function get_pagination_options(self, options)
     error("options must be a table when specified", 3)
   end
 
-  options = utils.cycle_aware_deep_copy(options, true)
+  options = kong_table.cycle_aware_deep_copy(options, true)
 
   if type(options.pagination) == "table" then
     options.pagination = table_merge(self.pagination, options.pagination)
@@ -173,7 +175,7 @@ local function validate_options_value(self, options)
 
   if options.workspace then
     if type(options.workspace) == "string" then
-      if not utils.is_valid_uuid(options.workspace) then
+      if not is_valid_uuid(options.workspace) then
         local ws = kong.db.workspaces:select_by_name(options.workspace)
         if ws then
           options.workspace = ws.id
@@ -286,6 +288,12 @@ local function validate_options_value(self, options)
   if options.export ~= nil then
     if type(options.export) ~= "boolean" then
       errors.export = "must be a boolean"
+    end
+  end
+
+  if options.skip_ttl ~= nil then
+    if type(options.skip_ttl) ~= "boolean" then
+      errors.skip_ttl = "must be a boolean"
     end
   end
 
@@ -628,7 +636,7 @@ local function check_upsert(self, key, entity, options, name)
 end
 
 
-local function recursion_over_constraints(self, entity, show_ws_id, entries, c)
+local function recursion_over_constraints(self, entity, opts, entries, c)
   local constraints = c and c.schema:get_constraints()
                       or self.schema:get_constraints()
 
@@ -642,7 +650,7 @@ local function recursion_over_constraints(self, entity, show_ws_id, entries, c)
     if constraint.on_delete == "cascade" then
       local dao = self.db.daos[constraint.schema.name]
       local method = "each_for_" .. constraint.field_name
-      for row, err in dao[method](dao, pk, nil, show_ws_id) do
+      for row, err in dao[method](dao, pk, nil, opts) do
         if not row then
           log(ERR, "[db] failed to traverse entities for cascade-delete: ", err)
           break
@@ -650,7 +658,7 @@ local function recursion_over_constraints(self, entity, show_ws_id, entries, c)
 
         insert(entries, { dao = dao, entity = row })
 
-        recursion_over_constraints(self, row, show_ws_id, entries, constraint)
+        recursion_over_constraints(self, row, opts, entries, constraint)
       end
     end
   end
@@ -659,10 +667,10 @@ local function recursion_over_constraints(self, entity, show_ws_id, entries, c)
 end
 
 
-local function find_cascade_delete_entities(self, entity, show_ws_id)
+local function find_cascade_delete_entities(self, entity, opts)
   local entries = {}
 
-  recursion_over_constraints(self, entity, show_ws_id, entries)
+  recursion_over_constraints(self, entity, opts, entries)
 
   return entries
 end
@@ -806,12 +814,14 @@ local function generate_foreign_key_methods(schema)
         local entity_to_update, rbw_entity, err, err_t = check_update(self, unique_value,
                                                                       entity, options, name)
         if not entity_to_update then
+          run_hook("dao:update_by:fail", err_t, entity_to_update, self.schema.name, options)
           return nil, err, err_t
         end
 
         local row, err_t = self.strategy:update_by_field(name, unique_value,
                                                          entity_to_update, options)
         if not row then
+          run_hook("dao:update_by:fail", err_t, entity_to_update, self.schema.name, options)
           return nil, tostring(err_t), err_t
         end
 
@@ -861,12 +871,14 @@ local function generate_foreign_key_methods(schema)
         local row, err_t = self.strategy:upsert_by_field(name, unique_value,
                                                          entity_to_upsert, options)
         if not row then
+          run_hook("dao:upsert_by:fail", err_t, entity_to_upsert, self.schema.name, options)
           return nil, tostring(err_t), err_t
         end
 
         local ws_id = row.ws_id
         row, err, err_t = self:row_to_entity(row, options)
         if not row then
+          run_hook("dao:upsert_by:fail", err_t, entity_to_upsert, self.schema.name, options)
           return nil, err, err_t
         end
 
@@ -895,8 +907,9 @@ local function generate_foreign_key_methods(schema)
           return nil, err, err_t
         end
 
-        local show_ws_id = { show_ws_id = true }
-        local entity, err, err_t = self["select_by_" .. name](self, unique_value, show_ws_id)
+        local select_options = deep_copy(options or {})
+        select_options["show_ws_id"] = true
+        local entity, err, err_t = self["select_by_" .. name](self, unique_value, select_options)
         if err then
           return nil, err, err_t
         end
@@ -905,7 +918,7 @@ local function generate_foreign_key_methods(schema)
           return true
         end
 
-        local cascade_entries = find_cascade_delete_entities(self, entity, show_ws_id)
+        local cascade_entries = find_cascade_delete_entities(self, entity, select_options)
 
         local ok, err_t = run_hook("dao:delete_by:pre",
                                    entity,
@@ -919,9 +932,11 @@ local function generate_foreign_key_methods(schema)
         local rows_affected
         rows_affected, err_t = self.strategy:delete_by_field(name, unique_value, options)
         if err_t then
+          run_hook("dao:delete_by:fail", err_t, entity, self.schema.name, options)
           return nil, tostring(err_t), err_t
 
         elseif not rows_affected then
+          run_hook("dao:delete_by:post", nil, self.schema.name, options, entity.ws_id, nil)
           return nil
         end
 
@@ -951,12 +966,17 @@ function _M.new(db, schema, strategy, errors)
   local fk_methods = generate_foreign_key_methods(schema)
   local super      = setmetatable(fk_methods, DAO)
 
+  local pagination = strategy.connector and
+                     type(strategy.connector) == "table" and
+                     strategy.connector.defaults.pagination or
+                     defaults.pagination
+
   local self = {
     db         = db,
     schema     = schema,
     strategy   = strategy,
     errors     = errors,
-    pagination = utils.shallow_copy(defaults.pagination),
+    pagination = kong_table.shallow_copy(pagination),
     super      = super,
   }
 
@@ -1118,7 +1138,7 @@ function DAO:each_for_export(size, options)
     if not options then
       options = get_pagination_options(self, options)
     else
-      options = utils.cycle_aware_deep_copy(options, true)
+      options = kong_table.cycle_aware_deep_copy(options, true)
     end
 
     options.export = true
@@ -1147,12 +1167,14 @@ function DAO:insert(entity, options)
 
   local row, err_t = self.strategy:insert(entity_to_insert, options)
   if not row then
+    run_hook("dao:insert:fail", err_t, entity, self.schema.name, options)
     return nil, tostring(err_t), err_t
   end
 
   local ws_id = row.ws_id
   row, err, err_t = self:row_to_entity(row, options)
   if not row then
+    run_hook("dao:insert:fail", err, entity, self.schema.name, options)
     return nil, err, err_t
   end
 
@@ -1200,12 +1222,14 @@ function DAO:update(pk_or_entity, entity, options)
 
   local row, err_t = self.strategy:update(primary_key, entity_to_update, options)
   if not row then
+    run_hook("dao:update:fail", err_t, entity_to_update, self.schema.name, options)
     return nil, tostring(err_t), err_t
   end
 
   local ws_id = row.ws_id
   row, err, err_t = self:row_to_entity(row, options)
   if not row then
+    run_hook("dao:update:fail", err_t, entity_to_update, self.schema.name, options)
     return nil, err, err_t
   end
 
@@ -1292,8 +1316,9 @@ function DAO:delete(pk_or_entity, options)
     return nil, tostring(err_t), err_t
   end
 
-  local show_ws_id = { show_ws_id = true }
-  local entity, err, err_t = self:select(primary_key, show_ws_id)
+  local select_options = deep_copy(options or {})
+  select_options["show_ws_id"] = true
+  local entity, err, err_t = self:select(primary_key, select_options)
   if err then
     return nil, err, err_t
   end
@@ -1310,7 +1335,7 @@ function DAO:delete(pk_or_entity, options)
     end
   end
 
-  local cascade_entries = find_cascade_delete_entities(self, primary_key, show_ws_id)
+  local cascade_entries = find_cascade_delete_entities(self, primary_key, select_options)
 
   local ws_id = entity.ws_id
   local _
@@ -1327,9 +1352,11 @@ function DAO:delete(pk_or_entity, options)
   local rows_affected
   rows_affected, err_t = self.strategy:delete(primary_key, options)
   if err_t then
+    run_hook("dao:delete:fail", err_t, entity, self.schema.name, options)
     return nil, tostring(err_t), err_t
 
   elseif not rows_affected then
+    run_hook("dao:delete:post", nil, self.schema.name, options, ws_id, nil)
     return nil
   end
 
@@ -1472,12 +1499,12 @@ function DAO:post_crud_event(operation, entity, old_entity, options)
   if self.events then
     local entity_without_nulls
     if entity then
-      entity_without_nulls = remove_nulls(utils.cycle_aware_deep_copy(entity, true))
+      entity_without_nulls = remove_nulls(kong_table.cycle_aware_deep_copy(entity, true))
     end
 
     local old_entity_without_nulls
     if old_entity then
-      old_entity_without_nulls = remove_nulls(utils.cycle_aware_deep_copy(old_entity, true))
+      old_entity_without_nulls = remove_nulls(kong_table.cycle_aware_deep_copy(old_entity, true))
     end
 
     local ok, err = self.events.post_local("dao:crud", operation, {
@@ -1539,7 +1566,7 @@ function DAO:cache_key(key, arg2, arg3, arg4, arg5, ws_id)
     error("key must be a string or an entity table", 2)
   end
 
-  if key.ws_id ~= nil and key.ws_id ~= null then
+  if key.ws_id ~= nil and key.ws_id ~= null and schema.workspaceable then
     ws_id = key.ws_id
   end
 

@@ -9,6 +9,7 @@ local lower = string.lower
 local HEADERS = constants.HEADERS
 local BUNDLED_VAULTS = constants.BUNDLED_VAULTS
 local BUNDLED_PLUGINS = constants.BUNDLED_PLUGINS
+local SOCKETS = constants.SOCKETS
 
 
 -- Version 5.7: https://wiki.mozilla.org/Security/Server_Side_TLS
@@ -83,6 +84,9 @@ local DEFAULT_PATHS = {
 }
 
 
+local DEFAULT_PLUGINSERVER_PATH = "/usr/local/bin"
+
+
 local HEADER_KEY_TO_NAME = {
   ["server_tokens"] = "server_tokens",
   ["latency_tokens"] = "latency_tokens",
@@ -102,7 +106,7 @@ local UPSTREAM_HEADER_KEY_TO_NAME = {
 }
 
 
-local EMPTY = {}
+local EMPTY = require("kong.tools.table").EMPTY
 
 
 -- NOTE! Prefixes should always follow `nginx_[a-z]+_`.
@@ -305,6 +309,8 @@ local CONF_PARSERS = {
     },
   },
 
+  nginx_wasm_main_shm_kv = { typ = "string" },
+
   worker_events_max_payload = { typ = "number" },
 
   upstream_keepalive_pool_size = { typ = "number" },
@@ -368,6 +374,17 @@ local CONF_PARSERS = {
   dns_not_found_ttl = { typ = "number" },
   dns_error_ttl = { typ = "number" },
   dns_no_sync = { typ = "boolean" },
+
+  new_dns_client = { typ = "boolean" },
+
+  resolver_address = { typ = "array" },
+  resolver_hosts_file = { typ = "string" },
+  resolver_family = { typ = "array" },
+  resolver_valid_ttl = { typ = "number" },
+  resolver_stale_ttl = { typ = "number" },
+  resolver_error_ttl = { typ = "number" },
+  resolver_lru_cache_size = { typ = "number" },
+
   privileged_worker = {
     typ = "boolean",
     deprecated = {
@@ -495,6 +512,9 @@ local CONF_PARSERS = {
   cluster_max_payload = { typ = "number" },
   cluster_use_proxy = { typ = "boolean" },
   cluster_dp_labels = { typ = "array" },
+  cluster_rpc = { typ = "boolean" },
+  cluster_rpc_sync = { typ = "boolean" },
+  cluster_cjson = { typ = "boolean" },
 
   kic = { typ = "boolean" },
   pluginserver_names = { typ = "array" },
@@ -539,15 +559,17 @@ local CONF_PARSERS = {
 
   wasm = { typ = "boolean" },
   wasm_filters_path = { typ = "string" },
+  wasm_filters = { typ = "array" },
 
   error_template_html = { typ = "string" },
   error_template_json = { typ = "string" },
   error_template_xml = { typ = "string" },
   error_template_plain = { typ = "string" },
 
-  admin_gui_url = {typ = "string"},
-  admin_gui_path = {typ = "string"},
-  admin_gui_api_url = {typ = "string"},
+  admin_gui_url = { typ = "array" },
+  admin_gui_path = { typ = "string" },
+  admin_gui_api_url = { typ = "string" },
+  admin_gui_csp_header = { typ = "boolean" },
 
   request_debug = { typ = "boolean" },
   request_debug_token = { typ = "string" },
@@ -562,7 +584,7 @@ local CONF_SENSITIVE = {
   pg_ro_password = true,
   proxy_server = true, -- hide proxy server URL as it may contain credentials
   declarative_config_string = true, -- config may contain sensitive info
-  -- may contain absolute or base64 value of the the key
+  -- may contain absolute or base64 value of the key
   cluster_cert_key = true,
   ssl_cert_key = true,
   client_ssl_cert_key = true,
@@ -570,6 +592,7 @@ local CONF_SENSITIVE = {
   admin_gui_ssl_cert_key = true,
   status_ssl_cert_key = true,
   debug_ssl_cert_key = true,
+  ["$refs"] = true, -- for internal use only, no need to log
 }
 
 
@@ -621,9 +644,11 @@ return {
   HEADERS = HEADERS,
   BUNDLED_VAULTS = BUNDLED_VAULTS,
   BUNDLED_PLUGINS = BUNDLED_PLUGINS,
+  SOCKETS = SOCKETS,
 
   CIPHER_SUITES = CIPHER_SUITES,
   DEFAULT_PATHS = DEFAULT_PATHS,
+  DEFAULT_PLUGINSERVER_PATH = DEFAULT_PLUGINSERVER_PATH,
   HEADER_KEY_TO_NAME = HEADER_KEY_TO_NAME,
   UPSTREAM_HEADER_KEY_TO_NAME = UPSTREAM_HEADER_KEY_TO_NAME,
   DYNAMIC_KEY_NAMESPACES = DYNAMIC_KEY_NAMESPACES,
@@ -638,4 +663,6 @@ return {
   _NOP_TOSTRING_MT = _NOP_TOSTRING_MT,
 
   LMDB_VALIDATION_TAG = LMDB_VALIDATION_TAG,
+
+  WASM_BUNDLED_FILTERS_PATH = "/usr/local/kong/wasm",
 }

@@ -9,7 +9,7 @@ if uh.database_type() == 'postgres' then
         end)
 
         lazy_teardown(function ()
-            assert(uh.stop_kong(nil, true))
+            assert(uh.stop_kong())
         end)
 
         uh.setup(function ()
@@ -41,7 +41,7 @@ if uh.database_type() == 'postgres' then
             admin_client:close()
         end)
 
-        uh.new_after_up("has updated acme redis configuration", function ()
+        uh.new_after_finish("has updated acme redis configuration", function ()
             local admin_client = assert(uh.admin_client())
             local res = assert(admin_client:send {
                 method = "GET",

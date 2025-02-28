@@ -36,15 +36,15 @@ nfpm_release_select = repository_rule(
 
 def nfpm_repositories():
     npfm_matrix = [
-        ["linux", "x86_64", "6dd3b07d4d6ee373baea5b5fca179ebf78dec38c9a55392bae34040e596e4de7"],
-        ["linux", "arm64", "e6487dca9d9e9b1781fe7fa0a3d844e70cf12d92f3b5fc0c4ff771aa776b05ca"],
-        ["Darwin", "x86_64", "19954ef8e6bfa0607efccd0a97452b6d571830665bd76a2f9957413f93f9d8cd"],
-        ["Darwin", "arm64", "9fd82cda017cdfd49b010199a2eed966d0a645734d9a6bf932c4ef82c8c12c96"],
+        ["linux", "x86_64", "e763ba82cc844c0084b66a386ccaff801b3e655a5bb20d222c3329880ff2e958"],
+        ["linux", "arm64", "985496acee0bc6d7fdb2a41f94208120a7cf025e37446286c4aaa0988a18f268"],
+        ["Darwin", "x86_64", "9b891d9386609dbd91d5aa76bde61342bc0f48514b8759956489fe2eaf6622b7"],
+        ["Darwin", "arm64", "5d192dd168c3f9f507db977d34c888b9f7c07331a5ba4099750809de3d0d010a"],
     ]
     for name, arch, sha in npfm_matrix:
         http_archive(
             name = "nfpm_%s_%s" % (name, arch),
-            url = "https://github.com/goreleaser/nfpm/releases/download/v2.31.0/nfpm_2.31.0_%s_%s.tar.gz" % (name, arch),
+            url = "https://github.com/goreleaser/nfpm/releases/download/v2.41.2/nfpm_2.41.2_%s_%s.tar.gz" % (name, arch),
             sha256 = sha,
             build_file = "//build/nfpm:BUILD.bazel",
         )

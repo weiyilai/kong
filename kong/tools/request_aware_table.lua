@@ -1,9 +1,13 @@
 --- NOTE: tool is designed to assist with **detecting** request contamination
 -- issues on CI, during test runs. It does not offer security safeguards.
+--
+-- TODO: need to resolve the following issues in debug mode,
+--  1. `:clear` could not clear elements inserted by `table.insert()`
+--  2. `table.concat()` couldn't work for elements assigned using `indexing`
 
 local table_new = require("table.new")
 local table_clear = require("table.clear")
-local get_request_id = require("kong.tracing.request_id").get
+local get_request_id = require("kong.observability.tracing.request_id").get
 
 
 -- set in new()

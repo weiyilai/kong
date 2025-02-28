@@ -1,8 +1,8 @@
 """A module defining the third party dependency WasmX"""
 
-load("@bazel_tools//tools/build_defs/repo:git.bzl", "new_git_repository")
 load("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
 load("@kong_bindings//:variables.bzl", "KONG_VAR")
+load("//build:build_system.bzl", "git_or_local_repository")
 
 wasm_runtime_build_file = """
 filegroup(
@@ -32,22 +32,22 @@ wasm_runtimes = {
     },
     "v8": {
         "linux": {
-            "x86_64": "41309c43d0f06334c8cf553b34973c42cfbdc3aadc1ca374723d4b6de48992d9",
-            "aarch64": "4e8b3881762b31078299ff1be2d48280c32ab4e1d48a0ce9ec267c4e302bb9ea",
+            "x86_64": "06b617a2b90ef81c302421937691e4f353ce2a2f3234607a8d270b1196c410f2",
+            "aarch64": "1e086105c27e9254ac2731eaf3dfb83d3966caa870ae984f5c92284bd26d1a3c",
         },
         "macos": {
-            "x86_64": "862260d74f39a96aac556f821c28beb4def5ad5d1e5c70a0aa80d1af7d581f8b",
+            "x86_64": "0ed81aae1336720aaec833c37aa6bb2db2b611e044746d65d497f285dff367ac",
             # "aarch64": None, no aarch64 v8 runtime release yet
         },
     },
     "wasmtime": {
         "linux": {
-            "x86_64": "a1285b0e2e3c6edf9cb6c7f214a682780f01ca8746a5d03f162512169cdf1e50",
-            "aarch64": "ef527ed31c3f141b5949bfd2e766a908f44b66ee839d4f0f22e740186236fd48",
+            "x86_64": "8eff9cf96c2fe86e5f6d55fd92a28fb7a48504fdea54cd588fa4d08f9a95eb36",
+            "aarch64": "8b9212ba5dd2742fdb5d97c49d0f9dce99a7a86cb43a135a1a70d6d355191560",
         },
         "macos": {
-            "x86_64": "c30ffb79f8097512fbe9ad02503dcdb0cd168eec2112b6951a013eed51050245",
-            "aarch64": "2834d667fc218925184db77fa91eca44d14f688a4972e2f365fe2b7c12e6d49f",
+            "x86_64": "bb4778e3e34dbdf4f5cc3f2e508384f45670834276a1085b17558caa2ebfd737",
+            "aarch64": "b3c5903d8d01fa7a71e4cec86fd6b1c7d85e0f90915a49870e7954e4cba0f5b3",
         },
     },
 }
@@ -57,8 +57,8 @@ def wasmx_repositories():
     if wasm_module_branch == "":
         wasm_module_branch = KONG_VAR["NGX_WASM_MODULE"]
 
-    new_git_repository(
-        name = "ngx_wasm_module",
+    git_or_local_repository(
+        name = "ngx_wasmx_module",
         branch = wasm_module_branch,
         remote = KONG_VAR["NGX_WASM_MODULE_REMOTE"],
         build_file_content = """
@@ -69,8 +69,8 @@ filegroup(
 )
 
 filegroup(
-    name = "lua_libs",
-    srcs = glob(["lib/resty/**"]),
+    name = "lualib_srcs",
+    srcs = glob(["lib/**/*.lua"]),
     visibility = ["//visibility:public"]
 )
 

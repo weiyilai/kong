@@ -1,7 +1,6 @@
 -- Kong runloop
 
 local meta         = require "kong.meta"
-local utils        = require "kong.tools.utils"
 local Router       = require "kong.router"
 local balancer     = require "kong.runloop.balancer"
 local events       = require "kong.runloop.events"
@@ -12,12 +11,12 @@ local constants    = require "kong.constants"
 local concurrency  = require "kong.concurrency"
 local lrucache     = require "resty.lrucache"
 local ktls         = require "resty.kong.tls"
-local request_id   = require "kong.tracing.request_id"
+local request_id   = require "kong.observability.tracing.request_id"
 
 
 local PluginsIterator = require "kong.runloop.plugins_iterator"
 local log_level       = require "kong.runloop.log_level"
-local instrumentation = require "kong.tracing.instrumentation"
+local instrumentation = require "kong.observability.tracing.instrumentation"
 local req_dyn_hook   = require "kong.dynamic_hook"
 
 
@@ -36,6 +35,7 @@ local gsub              = string.gsub
 local find              = string.find
 local lower             = string.lower
 local fmt               = string.format
+
 local ngx               = ngx
 local var               = ngx.var
 local log               = ngx.log
@@ -50,8 +50,10 @@ local http_version      = ngx.req.http_version
 local request_id_get    = request_id.get
 local escape            = require("kong.tools.uri").escape
 local encode            = require("string.buffer").encode
+local uuid              = require("kong.tools.uuid").uuid
+local EMPTY            = require("kong.tools.table").EMPTY
 
-local req_dyn_hook_run_hooks = req_dyn_hook.run_hooks
+local req_dyn_hook_run_hook = req_dyn_hook.run_hook
 
 local is_http_module   = subsystem == "http"
 local is_stream_module = subsystem == "stream"
@@ -69,6 +71,9 @@ local ROUTERS_REBUILD_COUNTER_KEY =
 local ROUTER_CACHE_SIZE = DEFAULT_MATCH_LRUCACHE_SIZE
 local ROUTER_CACHE = lrucache.new(ROUTER_CACHE_SIZE)
 local ROUTER_CACHE_NEG = lrucache.new(ROUTER_CACHE_SIZE)
+
+
+local DEFAULT_PROXY_HTTP_VERSION = "1.1"
 
 
 local NOOP = function() end
@@ -226,7 +231,7 @@ end
 -- or an error happened).
 -- @returns error message as a second return value in case of failure/error
 local function rebuild(name, callback, version, opts)
-  local current_version, err = kong.core_cache:get(name .. ":version", TTL_ZERO, utils.uuid)
+  local current_version, err = kong.core_cache:get(name .. ":version", TTL_ZERO, uuid)
   if err then
     return nil, "failed to retrieve " .. name .. " version: " .. err
   end
@@ -251,8 +256,9 @@ local function should_process_route(route)
 end
 
 
-local function load_service_from_db(service_pk)
-  local service, err = kong.db.services:select(service_pk, GLOBAL_QUERY_OPTS)
+local function load_service_from_db(service_pk, ws_id)
+  local options = ws_id and { workspace = ws_id, show_ws_id = true }
+  local service, err = kong.db.services:select(service_pk, options)
   if service == nil then
     -- the third value means "do not cache"
     return nil, err, -1
@@ -294,20 +300,21 @@ local function get_service_for_route(db, route, services_init_cache)
   end
 
   local err
+  local ws_id = route.ws_id
 
   -- kong.core_cache is available, not in init phase
   if kong.core_cache and db.strategy ~= "off" then
     local cache_key = db.services:cache_key(service_pk.id, nil, nil, nil, nil,
-                                            route.ws_id)
+                                            ws_id)
     service, err = kong.core_cache:get(cache_key, TTL_ZERO,
-                                       load_service_from_db, service_pk)
+                                       load_service_from_db, service_pk, ws_id)
 
   else -- dbless or init phase, kong.core_cache not needed/available
 
     -- A new service/route has been inserted while the initial route
     -- was being created, on init (perhaps by a different Kong node).
     -- Load the service individually and update services_init_cache with it
-    service, err = load_service_from_db(service_pk)
+    service, err = load_service_from_db(service_pk, ws_id)
     services_init_cache[id] = service
   end
 
@@ -333,7 +340,7 @@ end
 
 
 local function get_router_version()
-  return kong.core_cache:get("router:version", TTL_ZERO, utils.uuid)
+  return kong.core_cache:get("router:version", TTL_ZERO, uuid)
 end
 
 
@@ -354,7 +361,18 @@ local function new_router(version)
     end
   end
 
-  local detect_changes = db.strategy ~= "off" and kong.core_cache
+  -- We need to detect router changes if there is some one modifying the routers,
+  -- like rebuild_router_timer. And it relies on core_cache to detect changes.
+  --
+  -- 1. stratey off (dbless)
+  --      rpc_sync on:
+  --             non init worker: true(kong.core_cache)
+  --                 init worker: false
+  --      rpc_sync off:   false
+  -- 2. strategy on (non dbless): true(kong.core_cache)
+  local detect_changes = kong.core_cache and
+          (db.strategy ~= "off" or (kong.sync and get_phase() ~= "init_worker"))
+
   local counter = 0
   local page_size = db.routes.pagination.max_page_size
   for route, err in db.routes:each(page_size, GLOBAL_QUERY_OPTS) do
@@ -419,6 +437,17 @@ end
 
 
 local function build_router(version)
+  -- as new_router may be interrupted, and after init_worker we assume
+  -- the ROUTE is never nil, we create an empty router which cannot be
+  -- interrupted and will be replaced by the new_router
+  if version == "init" then
+    local err
+    ROUTER, err = Router.new(EMPTY, ROUTER_CACHE, ROUTER_CACHE_NEG, ROUTER)
+    if not ROUTER then
+      log(ERR, "could not create an empty router: ", err)
+    end
+  end
+
   local router, err = new_router(version)
   if not router then
     return nil, err
@@ -533,7 +562,7 @@ end
 
 
 local function update_plugins_iterator()
-  local version, err = kong.core_cache:get("plugins_iterator:version", TTL_ZERO, utils.uuid)
+  local version, err = kong.core_cache:get("plugins_iterator:version", TTL_ZERO, uuid)
   if err then
     return nil, "failed to retrieve plugins iterator version: " .. err
   end
@@ -621,7 +650,7 @@ end
 
 local reconfigure_handler
 do
-  local get_monotonic_ms = utils.get_updated_monotonic_ms
+  local get_monotonic_ms = require("kong.tools.time").get_updated_monotonic_ms
 
   local ngx_worker_id = ngx.worker.id
   local exiting = ngx.worker.exiting
@@ -892,11 +921,9 @@ return {
 
   init_worker = {
     before = function()
-      -- TODO: PR #9337 may affect the following line
-      local prefix = kong.configuration.prefix or ngx.config.prefix()
-
-      STREAM_TLS_TERMINATE_SOCK = fmt("unix:%s/stream_tls_terminate.sock", prefix)
-      STREAM_TLS_PASSTHROUGH_SOCK = fmt("unix:%s/stream_tls_passthrough.sock", prefix)
+      local socket_path = kong.configuration.socket_path
+      STREAM_TLS_TERMINATE_SOCK = fmt("unix:%s/%s", socket_path, constants.SOCKETS.STREAM_TLS_TERMINATE)
+      STREAM_TLS_PASSTHROUGH_SOCK = fmt("unix:%s/%s", socket_path, constants.SOCKETS.STREAM_TLS_PASSTHROUGH)
 
       log_level.init_worker()
 
@@ -959,57 +986,118 @@ return {
         end
       end
 
-      if strategy ~= "off" then
+      -- start some rebuild timers for
+      -- 1. traditional mode
+      -- 2. DP with rpc sync on (dbless mode)
+      if strategy ~= "off" or kong.sync then
         local worker_state_update_frequency = kong.configuration.worker_state_update_frequency or 1
 
-        local function rebuild_timer(premature)
+        --[[
+                    +-----------+
+                    |   Start   | <-------------------------------------+
+                    +-----------+                                       |
+                          |                                             |
+                          |                                             |
+                          v                                             |
+                    ***************************           +-------+     |
+                    * Is reconfigure running? * ---Yes--->| Sleep | ----+
+                    ***************************           +-------+
+                          |                                   ^
+                          No                                  |
+                          |                                   |
+                          v                                   |
+                    +---------------+                         |
+                    | rebuild router|-------------------------+
+                    +---------------+
+
+            Since reconfigure will also rebuild the router, we skip this round
+            of rebuilding the router.
+        --]]
+        local router_async_opts = {
+          name = RECONFIGURE_OPTS and RECONFIGURE_OPTS.name or "router", -- please check the above diagram for the
+                                        -- reason of using the same name as reconfigure
+          timeout = 0,
+          on_timeout = "return_true",
+        }
+
+        local function rebuild_router_timer(premature)
           if premature then
             return
           end
 
-          local router_update_status, err = rebuild_router({
-            name = "router",
-            timeout = 0,
-            on_timeout = "return_true",
-          })
-          if not router_update_status then
+          -- Don't wait for the semaphore (timeout = 0) when updating via the
+          -- timer.
+          -- If the semaphore is locked, that means that the rebuild is
+          -- already ongoing.
+          local ok, err = rebuild_router(router_async_opts)
+          if not ok then
             log(ERR, "could not rebuild router via timer: ", err)
           end
+        end
 
-          local plugins_iterator_update_status, err = rebuild_plugins_iterator({
-            name = "plugins_iterator",
-            timeout = 0,
-            on_timeout = "return_true",
-          })
-          if not plugins_iterator_update_status then
-            log(ERR, "could not rebuild plugins iterator via timer: ", err)
+        local _, err = kong.timer:named_every("router-rebuild",
+                                              worker_state_update_frequency,
+                                              rebuild_router_timer)
+        if err then
+          log(ERR, "could not schedule timer to rebuild router: ", err)
+        end
+
+        local plugins_iterator_async_opts = {
+          name = "plugins_iterator",
+          timeout = 0,
+          on_timeout = "return_true",
+        }
+
+        local function rebuild_plugins_iterator_timer(premature)
+          if premature then
+            return
           end
 
-          if wasm.enabled() then
-            local wasm_update_status, err = rebuild_wasm_state({
-              name = "wasm",
-              timeout = 0,
-              on_timeout = "return_true",
-            })
-            if not wasm_update_status then
+          local _, err = rebuild_plugins_iterator(plugins_iterator_async_opts)
+          if err then
+            log(ERR, "could not rebuild plugins iterator via timer: ", err)
+          end
+        end
+
+        local _, err = kong.timer:named_every("plugins-iterator-rebuild",
+                                              worker_state_update_frequency,
+                                              rebuild_plugins_iterator_timer)
+        if err then
+          log(ERR, "could not schedule timer to rebuild plugins iterator: ", err)
+        end
+
+        if wasm.enabled() then
+          local wasm_async_opts = {
+            name = "wasm",
+            timeout = 0,
+            on_timeout = "return_true",
+          }
+
+          local function rebuild_wasm_filter_chains_timer(premature)
+            if premature then
+              return
+            end
+
+            local _, err = rebuild_wasm_state(wasm_async_opts)
+            if err then
               log(ERR, "could not rebuild wasm filter chains via timer: ", err)
             end
           end
-        end
 
-        local _, err = kong.timer:named_every("rebuild",
-                                         worker_state_update_frequency,
-                                         rebuild_timer)
-        if err then
-          log(ERR, "could not schedule timer to rebuild: ", err)
+          local _, err = kong.timer:named_every("wasm-rebuild",
+                                                worker_state_update_frequency,
+                                                rebuild_wasm_filter_chains_timer)
+          if err then
+            log(ERR, "could not schedule timer to rebuild WASM filter chains: ", err)
+          end
         end
-      end
+      end -- rebuild timer do block
     end,
   },
   preread = {
     before = function(ctx)
       local server_port = var.server_port
-      ctx.host_port = HOST_PORTS[server_port] or server_port
+      ctx.host_port = HOST_PORTS[server_port] or tonumber(server_port, 10)
 
       local router = get_updated_router()
 
@@ -1086,7 +1174,7 @@ return {
   rewrite = {
     before = function(ctx)
       local server_port = var.server_port
-      ctx.host_port = HOST_PORTS[server_port] or server_port
+      ctx.host_port = HOST_PORTS[server_port] or tonumber(server_port, 10)
       instrumentation.request(ctx)
     end,
   },
@@ -1112,7 +1200,7 @@ return {
       local has_timing = ctx.has_timing
 
       if has_timing then
-        req_dyn_hook_run_hooks(ctx, "timing", "before:router")
+        req_dyn_hook_run_hook("timing", "before:router")
       end
 
       -- routing request
@@ -1120,7 +1208,7 @@ return {
       local match_t = router:exec(ctx)
 
       if has_timing then
-        req_dyn_hook_run_hooks(ctx, "timing", "after:router")
+        req_dyn_hook_run_hook("timing", "after:router")
       end
 
       if not match_t then
@@ -1141,12 +1229,11 @@ return {
       ctx.workspace = match_t.route and match_t.route.ws_id
 
       if has_timing then
-        req_dyn_hook_run_hooks(ctx, "timing", "workspace_id:got", ctx.workspace)
+        req_dyn_hook_run_hook("timing", "workspace_id:got", ctx.workspace)
       end
 
       local host           = var.host
-      local port           = tonumber(ctx.host_port, 10)
-                          or tonumber(var.server_port, 10)
+      local port           = ctx.host_port or tonumber(var.server_port, 10)
 
       local route          = match_t.route
       local service        = match_t.service
@@ -1289,6 +1376,14 @@ return {
       var.upstream_x_forwarded_path   = forwarded_path
       var.upstream_x_forwarded_prefix = forwarded_prefix
 
+      do
+        local req_via = get_header(constants.HEADERS.VIA, ctx)
+        local kong_inbound_via = protocol_version and protocol_version .. " " .. SERVER_HEADER
+                                 or SERVER_HEADER
+        var.upstream_via = req_via and req_via .. ", " .. kong_inbound_via
+                           or kong_inbound_via
+      end
+
       -- At this point, the router and `balancer_setup_stage1` have been
       -- executed; detect requests that need to be redirected from `proxy_pass`
       -- to `grpc_pass`. After redirection, this function will return early
@@ -1360,8 +1455,9 @@ return {
         return exit(500)
       end
 
+      local header_cache = {}
       -- clear hop-by-hop request headers:
-      local http_connection = get_header("connection", ctx)
+      local http_connection = get_header("connection", header_cache)
       if http_connection ~= "keep-alive" and
          http_connection ~= "close"      and
          http_connection ~= "upgrade"
@@ -1382,7 +1478,7 @@ return {
       end
 
       -- add te header only when client requests trailers (proxy removes it)
-      local http_te = get_header("te", ctx)
+      local http_te = get_header("te", header_cache)
       if http_te then
         if http_te == "trailers" then
           var.upstream_te = "trailers"
@@ -1397,11 +1493,11 @@ return {
         end
       end
 
-      if var.http_proxy then
+      if get_header("proxy", header_cache) then
         clear_header("Proxy")
       end
 
-      if var.http_proxy_connection then
+      if get_header("proxy_connection", header_cache) then
         clear_header("Proxy-Connection")
       end
     end
@@ -1438,7 +1534,7 @@ return {
 
       local upstream_status_header = constants.HEADERS.UPSTREAM_STATUS
       if kong.configuration.enabled_headers[upstream_status_header] then
-        local upstream_status = ctx.buffered_status or tonumber(sub(var.upstream_status or "", -3))
+        local upstream_status = ctx.buffered_status or tonumber(sub(var.upstream_status or "", -3)) or ngx.status
         header[upstream_status_header] = upstream_status
         if not header[upstream_status_header] then
           log(ERR, "failed to set ", upstream_status_header, " header")
@@ -1478,7 +1574,31 @@ return {
         end
 
         if enabled_headers[headers.VIA] then
-          header[headers.VIA] = SERVER_HEADER
+          -- Kong does not support injected directives like 'nginx_location_proxy_http_version',
+          -- so we skip checking them.
+
+          local proxy_http_version
+
+          local upstream_scheme = var.upstream_scheme
+          if upstream_scheme == "grpc" or upstream_scheme == "grpcs" then
+            proxy_http_version = "2"
+          end
+          if not proxy_http_version then
+            proxy_http_version = ctx.proxy_http_version or
+                                 kong.configuration.proxy_http_version or
+                                 DEFAULT_PROXY_HTTP_VERSION
+          end
+
+          local kong_outbound_via = proxy_http_version .. " " .. SERVER_HEADER
+          local resp_via = var["upstream_http_" .. headers.VIA]
+          header[headers.VIA] = resp_via and resp_via .. ", " .. kong_outbound_via
+                                or kong_outbound_via
+        end
+
+        -- If upstream does not provide the 'Server' header, an 'openresty' header
+        -- would be inserted by default. We override it with the Kong server header.
+        if not header[headers.SERVER] and enabled_headers[headers.SERVER] then
+          header[headers.SERVER] = SERVER_HEADER
         end
 
       else
